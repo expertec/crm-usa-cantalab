@@ -5,7 +5,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   downloadMediaMessage
-} from '@whiskeysockets/baileys';
+} from 'baileys'; // Sin @whiskeysockets/
 import QRCode from 'qrcode-terminal';
 import Pino from 'pino';
 import fs from 'fs';

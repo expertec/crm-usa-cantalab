@@ -12,7 +12,8 @@ import fs from 'fs';
 import path from 'path';
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
-import axios from 'axios';      
+import axios from 'axios';
+import { enqueueStep } from './queue.js';      
 
 let latestQR = null;
 let connectionStatus = "Desconectado";
@@ -22,6 +23,76 @@ let sessionPhone = null; // almacenará el número de la sesión activa
 const localAuthFolder = '/var/data';
 const { FieldValue } = admin.firestore;
 const bucket = admin.storage().bucket();
+
+// Reemplaza {{campo}} con datos del lead.
+// Si usas {{nombre}} devuelve sólo la primera palabra.
+function tpl(str, lead) {
+  return String(str || '').replace(/\{\{(\w+)\}\}/g, (_, f) => {
+    const v = lead?.[f] ?? '';
+    return f === 'nombre' ? String(v).split(' ')[0] || '' : v;
+  });
+}
+
+/**
+ * Lee la secuencia por trigger y ENCOLA cada paso en `sequenceQueue`.
+ * Espera que cada message tenga: { type, contenido, delay } (delay en minutos).
+ */
+async function scheduleSequenceForLead(trigger, leadId, leadData = {}) {
+  const snap = await db.collection('secuencias')
+    .where('trigger', '==', trigger)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    console.warn(`[scheduleSequenceForLead] No existe secuencia para trigger "${trigger}"`);
+    return;
+  }
+  const seq = snap.docs[0].data();
+  const messages = Array.isArray(seq.messages) ? seq.messages : [];
+  if (!messages.length) return;
+
+  let accDelaySec = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const delayMin = Number(m.delay || 0);
+    accDelaySec += Math.max(0, delayMin) * 60;
+
+    // Mapeo a payload que entiende queue.js → deliverPayload()
+    let payload;
+    switch (m.type) {
+      case 'texto':
+      case 'formulario':
+        payload = { type: 'texto', text: tpl(m.contenido, leadData) };
+        break;
+      case 'audio':
+        payload = { type: 'audio', url: tpl(m.contenido, leadData) };
+        break;
+      case 'imagen':
+        payload = { type: 'imagen', url: tpl(m.contenido, leadData) };
+        break;
+      case 'video':
+        payload = { type: 'video', url: tpl(m.contenido, leadData) };
+        break;
+      default:
+        payload = { type: 'texto', text: tpl(m.contenido || '', leadData) };
+    }
+
+    await enqueueStep({
+      leadId,               // usamos el JID como ID de lead (igual que en tu DB)
+      sequenceId: trigger,
+      step: i,
+      payload,
+      delaySec: accDelaySec
+    });
+  }
+
+  // Marca en el lead que tiene secuencias activas (útil para UI / filtros)
+  await db.collection('leads').doc(leadId).set({
+    hasActiveSequences: true,
+    nextActionAt: new Date(Date.now() + accDelaySec * 1000)
+  }, { merge: true });
+}
+
 
 export async function connectToWhatsApp() {
   try {
@@ -187,12 +258,12 @@ sock.ev.on('messages.upsert', async ({ messages, type }) => {
       continue; // saltar este mensaje si falla descarga
     }
 
+ 
     // 4) BUSCAR O CREAR EL LEAD en Firestore usando JID como ID
-
 const leadRef = db.collection('leads').doc(jid);
 const docSnap = await leadRef.get();
 
-// Leemos configuración para defaultTrigger (solo una vez)
+// Lee config para defaultTrigger (si no hay, usa 'NuevoLead')
 const cfgSnap = await db.collection('config').doc('appConfig').get();
 const cfg = cfgSnap.exists ? cfgSnap.data() : {};
 
@@ -203,36 +274,47 @@ if (content.includes('#webPro1490')) {
 } else {
   trigger = cfg.defaultTrigger || 'NuevoLead';
 }
-const nowIso = new Date().toISOString();
+
+const leadId = jid;
+const baseLeadData = {
+  telefono: phone,
+  nombre: msg.pushName || '',
+  source: 'WhatsApp'
+};
 
 if (!docSnap.exists) {
-  // Si NO existe, creamos el lead nuevo con el JID como ID
+  // Crear lead (SIN secuenciasActivas)
   await leadRef.set({
-    telefono: phone,
-    nombre: msg.pushName || '',
-    source: 'WhatsApp',
+    ...baseLeadData,
     fecha_creacion: new Date(),
     estado: 'nuevo',
     etiquetas: [trigger],
-    secuenciasActivas: [
-      {
-        trigger,
-        startTime: nowIso,
-        index: 0
-      }
-    ],
     unreadCount: 0,
     lastMessageAt: new Date()
   });
+
+  // Encolar la secuencia inicial para este lead nuevo
+  await scheduleSequenceForLead(trigger, leadId, baseLeadData);
 } else {
-  // Si YA existe, actualizamos etiquetas, etc.
+  const cur = docSnap.data() || {};
+  const hadTag = Array.isArray(cur.etiquetas) && cur.etiquetas.includes(trigger);
+
+  // Actualiza meta y etiqueta
   await leadRef.update({
     etiquetas: admin.firestore.FieldValue.arrayUnion(trigger),
     lastMessageAt: new Date()
   });
+
+  // (Opcional) Solo si no tenía esa etiqueta, dispara la secuencia
+  if (!hadTag) {
+    await scheduleSequenceForLead(trigger, leadId, { ...cur, ...baseLeadData });
+  }
 }
 
-const leadId = jid;
+
+
+
+
 
 
     // 5) GUARDAR el mensaje dentro de /leads/{leadId}/messages

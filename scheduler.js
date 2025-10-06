@@ -1,6 +1,5 @@
 // src/server/scheduler.js
 import admin from 'firebase-admin';
-import { getWhatsAppSock } from './whatsappService.js';
 import { db } from './firebaseAdmin.js';
 import { Configuration, OpenAIApi } from 'openai';
 
@@ -9,44 +8,28 @@ import os from 'os';
 import path from 'path';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
-// al inicio de src/server/scheduler.js (o donde esté tu enviarMusicaPorWhatsApp)
-import { sendMessageToLead, sendAudioMessage } from './whatsappService.js';
-import { sendClipMessage } from './whatsappService.js';
-import { enqueueStep, processQueue } from './queue.js';
 
-
-
-
+import { processQueue, cancelSequenceForLead } from './queue.js';
+import { sendMessageToLead, sendClipMessage } from './whatsappService.js';
 
 const bucket = admin.storage().bucket();
-
 const { FieldValue } = admin.firestore;
-// Asegúrate de que la API key esté definida
-if (!process.env.OPENAI_API_KEY) {
-  throw new Error("Falta la variable de entorno OPENAI_API_KEY");
-}
 
-// Configuración de OpenAI
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// ==== OpenAI ====
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error('Falta la variable de entorno OPENAI_API_KEY');
+}
+const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
 const openai = new OpenAIApi(configuration);
 
-/**
- * Reemplaza placeholders en plantillas de texto.
- * {{campo}} se sustituye por leadData.campo si existe.
- */
+// ==== Util ====
 function replacePlaceholders(template, leadData) {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, field) => {
-    const value = leadData[field] || '';
-    if (field === 'nombre') {
-      // devolver sólo la primera palabra del nombre completo
-      return value.split(' ')[0] || '';
-    }
+  return String(template || '').replace(/\{\{(\w+)\}\}/g, (_, field) => {
+    const value = leadData?.[field] || '';
+    if (field === 'nombre') return String(value).split(' ')[0] || '';
     return value;
   });
 }
-
 
 async function downloadStream(url, destPath) {
   const res = await axios.get(url, { responseType: 'stream' });
@@ -60,112 +43,76 @@ async function downloadStream(url, destPath) {
 
 async function lanzarTareaSuno({ title, stylePrompt, lyrics }) {
   const url = 'https://apibox.erweima.ai/api/v1/generate';
-  const body = { model: "V4_5", customMode: true, instrumental: false,
-    title, style: stylePrompt, prompt: lyrics,
-    callbackUrl: process.env.CALLBACK_URL };
+  const body = {
+    model: 'V4_5',
+    customMode: true,
+    instrumental: false,
+    title,
+    style: stylePrompt,
+    prompt: lyrics,
+    callbackUrl: process.env.CALLBACK_URL
+  };
   console.log('🛠️ Suno request:', body);
   const res = await axios.post(url, body, {
     headers: {
-      'Content-Type':'application/json',
-      Authorization:`Bearer ${process.env.SUNO_API_KEY}`
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.SUNO_API_KEY}`
     }
   });
   console.log('🛠️ Suno response:', res.status, res.data);
-  if (res.data.code !== 200 || !res.data.data?.taskId)
+  if (res.data.code !== 200 || !res.data.data?.taskId) {
     throw new Error(`No taskId recibido: ${JSON.stringify(res.data)}`);
+  }
   return res.data.data.taskId;
 }
 
-/**
- * Envía un mensaje de WhatsApp según su tipo.
- * Usa exactamente el número que viene en lead.telefono (sin anteponer country code).
- */
-async function enviarMensaje(lead, mensaje) {
-  try {
-    const sock = getWhatsAppSock();
-    if (!sock) return;
+// ==== Cola: limpieza automática de NuevoLead cuando ya es MusicaLead ====
+async function cancelNuevoLeadForFormLeads({ limit = 300 }) {
+  const snap = await db
+    .collection('leads')
+    .where('etiquetas', 'array-contains', 'MusicaLead')
+    .limit(limit)
+    .get();
 
-    const phone = (lead.telefono || '').replace(/\D/g, '');
-    const jid = `${phone}@s.whatsapp.net`;
+  if (snap.empty) return 0;
 
-    switch (mensaje.type) {
-      case 'texto': {
-        const text = replacePlaceholders(mensaje.contenido, lead).trim();
-        if (text) await sock.sendMessage(jid, { text });
-        break;
-      }
-      case 'formulario': {
-        const rawTemplate = mensaje.contenido || '';
-        const nameVal = encodeURIComponent(lead.nombre || '');
-        const text = rawTemplate
-          .replace('{{telefono}}', phone)
-          .replace('{{nombre}}', nameVal)
-          .replace(/\r?\n/g, ' ')
-          .trim();
-        if (text) await sock.sendMessage(jid, { text });
-        break;
-      }
-      case 'audio': {
-        const audioUrl = replacePlaceholders(mensaje.contenido, lead);
-        console.log('→ Enviando PTT desde URL:', audioUrl);
-        await sock.sendMessage(jid, {
-          audio: { url: audioUrl },
-          ptt: true
-      
-        });
-        break;
-      }
-      case 'imagen':
-        await sock.sendMessage(jid, {
-          image: { url: replacePlaceholders(mensaje.contenido, lead) }
-        });
-        break;
-      case 'video':
-        await sock.sendMessage(jid, {
-          video: { url: replacePlaceholders(mensaje.contenido, lead) },
-          // si quieres un caption, descomenta la línea siguiente y añade mensaje.contenidoCaption en tu secuencia
-          // caption: replacePlaceholders(mensaje.contenidoCaption || '', lead)
-        });
-        break;
-      default:
-        console.warn(`Tipo desconocido: ${mensaje.type}`);
-    }
-  } catch (err) {
-    console.error("Error al enviar mensaje:", err);
+  let cancelled = 0;
+  for (const d of snap.docs) {
+    const lead = { id: d.id, ...d.data() };
+    if (lead.nuevoLeadCancelled) continue;
+
+    const n = await cancelSequenceForLead({ leadId: lead.id, sequenceId: 'NuevoLead' });
+    if (n > 0) cancelled += n;
+
+    await db.collection('leads').doc(lead.id).set(
+      { nuevoLeadCancelled: true },
+      { merge: true }
+    );
   }
+  return cancelled;
 }
 
-
-/**
- * Procesa las secuencias activas de cada lead.
- */
+// ==== CRON principal de secuencias (cola) ====
 async function processSequences() {
   try {
-    const processed = await processQueue({ batchSize: 100 }); // puedes subir a 200/500 si hay más carga
+    const c = await cancelNuevoLeadForFormLeads({ limit: 300 });
+    if (c) console.log(`🛑 cancelNuevoLeadForFormLeads: ${c} tareas canceladas`);
+    const processed = await processQueue({ batchSize: 100 }); // ajusta a 200/500 si hace falta
     if (processed > 0) {
       console.log(`✅ processSequences: ${processed} tasks enviados`);
     }
   } catch (err) {
-    console.error("Error en processSequences:", err);
+    console.error('Error en processSequences:', err);
   }
 }
 
-
-
-/**
- * Envía por WhatsApp los guiones generados (status 'enviarGuion'),
- * añade trigger 'GuionEnviado' al lead y marca status → 'enviado'.
- * Solo envía si han pasado al menos 15 minutos desde 'guionGeneratedAt'.
- */
-
-
-
-
+// ==== Flujos de música ====
 // 1) Generar letra
 async function generarLetraParaMusica() {
-  const snap = await db.collection('musica').where('status','==','Sin letra').limit(1).get();
+  const snap = await db.collection('musica').where('status', '==', 'Sin letra').limit(1).get();
   if (snap.empty) return;
   const docSnap = snap.docs[0], d = docSnap.data();
+
   const prompt = `
 Escribe una letra de canción con lenguaje simple siguiendo esta estructura:
 verso 1, verso 2, coro, verso 3, verso 4 y coro.
@@ -179,10 +126,11 @@ Anecdotas: ${d.anecdotes}.
     model: 'gpt-4o',
     messages: [
       { role: 'system', content: 'Eres un compositor creativo.' },
-      { role: 'user',   content: prompt }
+      { role: 'user', content: prompt }
     ],
     max_tokens: 400
   });
+
   const letra = resp.data.choices?.[0]?.message?.content?.trim();
   if (!letra) throw new Error(`No letra para ${docSnap.id}`);
 
@@ -204,40 +152,38 @@ Anecdotas: ${d.anecdotes}.
 
 // 2) Generar prompt
 async function generarPromptParaMusica() {
-  const snap = await db.collection('musica').where('status','==','Sin prompt').limit(1).get();
+  const snap = await db.collection('musica').where('status', '==', 'Sin prompt').limit(1).get();
   if (snap.empty) return;
+
   const docSnap = snap.docs[0];
   const { artist, genre, voiceType } = docSnap.data();
+
   const draft = `
-  Crea un promt para decirle a suno que haga una canción estilo exitos de  ${artist} genero 
-   ${genre} con tipo de voz ${voiceType}. Sin mencionar al artista en cuestion u otras palabras
-    que puedan causar conflictos de derecho de autor, centrate en los elementos musicales como ritmo, instrumentos,
-     generos. Suno requiere que sean maximo 120 caracteres y que le pases los elementos separados por coma, 
-     mira este ejemplo ( rock pop con influencias en blues, guitarra electrica, ritmo de bateria energico)
-      genera algo similar para cancion que quiero.
+Crea un prompt para pedir a Suno una canción con elementos de ${artist} (sin nombrarlo),
+género ${genre} y tipo de voz ${voiceType}. Máx 120 caracteres, elementos separados por comas.
+Ejemplo: "rock pop con influencias blues, guitarra eléctrica, batería enérgica".
   `.trim();
 
   const gptRes = await openai.createChatCompletion({
     model: 'gpt-4o',
     messages: [
       { role: 'system', content: 'Eres un redactor creativo de prompts musicales.' },
-      { role: 'user',   content: `Refina para <120 chars: "${draft}"` }
+      { role: 'user', content: `Refina para <120 chars y separa por comas: "${draft}"` }
     ]
   });
-  const stylePrompt = gptRes.data.choices[0].message.content.trim();
 
-  await docSnap.ref.update({
-    stylePrompt,
-    status: 'Sin música'
-  });
+  const stylePrompt = gptRes.data.choices[0].message.content.trim();
+  await docSnap.ref.update({ stylePrompt, status: 'Sin música' });
   console.log(`✅ generarPromptParaMusica: ${docSnap.id} → "${stylePrompt}"`);
 }
 
 // 3) Lanzar Suno
- async function generarMusicaConSuno() {
-  const snap = await db.collection('musica').where('status','==','Sin música').limit(1).get();
+async function generarMusicaConSuno() {
+  const snap = await db.collection('musica').where('status', '==', 'Sin música').limit(1).get();
   if (snap.empty) return;
+
   const docSnap = snap.docs[0], data = docSnap.data();
+
   await docSnap.ref.update({
     status: 'Procesando música',
     generatedAt: FieldValue.serverTimestamp()
@@ -245,24 +191,26 @@ async function generarPromptParaMusica() {
 
   try {
     const taskId = await lanzarTareaSuno({
-      title:      data.purpose.slice(0,30),
+      title: (data.purpose || '').slice(0, 30),
       stylePrompt: data.stylePrompt,
-      lyrics:      data.lyrics
+      lyrics: data.lyrics
     });
+
     await docSnap.ref.update({ taskId });
     console.log(`🔔 generarMusicaConSuno: task ${taskId} lanzado para ${docSnap.id}`);
   } catch (err) {
     console.error(`❌ generarMusicaConSuno(${docSnap.id}):`, err.message);
     await docSnap.ref.update({
-      status:   'Error música',
+      status: 'Error música',
       errorMsg: err.message,
       updatedAt: FieldValue.serverTimestamp()
     });
   }
 }
 
+// 4) Generar clip y subirlo
 async function procesarClips() {
-  const snap = await db.collection('musica').where('status','==','Audio listo').get();
+  const snap = await db.collection('musica').where('status', '==', 'Audio listo').get();
   if (snap.empty) return;
 
   for (const doc of snap.docs) {
@@ -276,16 +224,16 @@ async function procesarClips() {
     }
     await ref.update({ status: 'Generando clip' });
 
-    const tmpFull       = path.join(os.tmpdir(), `${id}-full.mp3`);
-    const tmpClip       = path.join(os.tmpdir(), `${id}-clip.m4a`);
-    const watermarkUrl  = 'https://cantalab.com/wp-content/uploads/2025/05/marca-de-agua-1-minuto.mp3';
-    const tmpWatermark  = path.join(os.tmpdir(), 'watermark.mp3');
-    const tmpFinal      = path.join(os.tmpdir(), `${id}-watermarked.m4a`);
+    const tmpFull = path.join(os.tmpdir(), `${id}-full.mp3`);
+    const tmpClip = path.join(os.tmpdir(), `${id}-clip.m4a`);
+    const watermarkUrl = 'https://cantalab.com/wp-content/uploads/2025/05/marca-de-agua-1-minuto.mp3';
+    const tmpWatermark = path.join(os.tmpdir(), 'watermark.mp3');
+    const tmpFinal = path.join(os.tmpdir(), `${id}-watermarked.m4a`);
 
-    // 1) Descargar full
+    // Descargar MP3 completo
     await downloadStream(fullUrl, tmpFull);
 
-    // 2) Crear clip de 60s → M4A/AAC
+    // Recortar 60s a AAC/M4A
     try {
       await new Promise((res, rej) => {
         ffmpeg(tmpFull)
@@ -304,7 +252,7 @@ async function procesarClips() {
       continue;
     }
 
-    // 3) Mezclar watermark → M4A final
+    // Mezclar marca de agua
     await downloadStream(watermarkUrl, tmpWatermark);
     try {
       await new Promise((res, rej) => {
@@ -327,7 +275,7 @@ async function procesarClips() {
       continue;
     }
 
-    // 4) Subir .m4a público
+    // Subir clip final
     try {
       const dest = `musica/clip/${id}-clip.m4a`;
       const [file] = await bucket.upload(tmpFinal, {
@@ -344,97 +292,80 @@ async function procesarClips() {
       await ref.update({ status: 'Error upload clip' });
     }
 
-    // 5) Limpieza
+    // Limpieza
     [tmpFull, tmpClip, tmpWatermark, tmpFinal].forEach(f => {
       try { fs.unlinkSync(f); } catch {}
     });
   }
-}  
+}
 
-/**
- * Lee todos los docs de 'musica' con status 'Enviar música',
- * envía letra y clip **una sola vez**, y actualiza a 'Enviada'.
- */
+// 5) Enviar letra + clip a WhatsApp y marcar Enviada
 async function enviarMusicaPorWhatsApp() {
-  const snap = await db.collection('musica')
-    .where('status', '==', 'Enviar música')
-    .get();
+  const snap = await db.collection('musica').where('status', '==', 'Enviar música').get();
   if (snap.empty) return;
 
   for (const doc of snap.docs) {
     const { leadId, leadPhone, lyrics, clipUrl } = doc.data();
     const ref = doc.ref;
 
-    // Validaciones
     if (!leadPhone || !lyrics || !clipUrl) {
       console.warn(`[${doc.id}] faltan datos, status sigue 'Enviar música'`);
       continue;
     }
 
     try {
-      // 1) Texto con letra
+      // saludo con letra
       const leadDoc = await db.collection('leads').doc(leadId).get();
-      const name = leadDoc.exists
-        ? leadDoc.data().nombre.split(' ')[0]
-        : '';
-      const saludo = name
-        ? `Hola ${name}, esta es la letra:\n\n${lyrics}`
-        : `Esta es la letra:\n\n${lyrics}`;
+      const name = leadDoc.exists ? (leadDoc.data().nombre || '').split(' ')[0] : '';
+      const saludo = name ? `Hola ${name}, esta es la letra:\n\n${lyrics}` : `Esta es la letra:\n\n${lyrics}`;
       await sendMessageToLead(leadPhone, saludo);
 
-      // 2) Texto de preámbulo
+      // preámbulo
       await sendMessageToLead(leadPhone, '¿Cómo la ves? Ahora escucha el clip.');
 
-      // 3) Audio inline desde URL
+      // audio inline
       await sendClipMessage(leadPhone, clipUrl);
 
-      // 4) Marcar como enviado (ya no volverá a entrar en este cron)
+      // marcar como enviada
       await ref.update({
         status: 'Enviada',
         sentAt: FieldValue.serverTimestamp()
       });
 
-      // 5) (Opcional) Disparar siguiente secuencia
-      await db.collection('leads').doc(leadId).update({
-        secuenciasActivas: FieldValue.arrayUnion({
-          trigger: 'CancionEnviada',
-          startTime: new Date().toISOString(),
-          index: 0
-        })
-      });
+      // (opcional) Etiqueta informativa; NO usamos secuenciasActivas
+      if (leadId) {
+        await db.collection('leads').doc(leadId).set(
+          { etiquetas: admin.firestore.FieldValue.arrayUnion('CancionEnviada') },
+          { merge: true }
+        );
+      }
 
       console.log(`✅ Música enviada a ${leadPhone} (doc ${doc.id})`);
     } catch (err) {
       console.error(`❌ Error en ${doc.id}:`, err);
-      // Actualizar a error para no reintentar infinitamente
-      await ref.update({
-        status: 'Error música',
-        errorMsg: err.message
-      });
+      await ref.update({ status: 'Error música', errorMsg: err.message });
     }
   }
 }
 
-
-
-// 6) Reintento de stuck
+// 6) Reintento de stuck de Suno
 async function retryStuckMusic(thresholdMin = 10) {
-  const cutoff = Date.now() - thresholdMin*60_000;
-  const snap = await db.collection('musica')
-    .where('status','==','Procesando música')
-    .where('generatedAt','<=',new Date(cutoff))
+  const cutoff = Date.now() - thresholdMin * 60_000;
+  const snap = await db
+    .collection('musica')
+    .where('status', '==', 'Procesando música')
+    .where('generatedAt', '<=', new Date(cutoff))
     .get();
+
   for (const docSnap of snap.docs) {
     await docSnap.ref.update({
-      status:'Sin música',
+      status: 'Sin música',
       taskId: FieldValue.delete(),
       errorMsg: FieldValue.delete(),
       updatedAt: FieldValue.serverTimestamp()
     });
   }
 }
-
-
 
 export {
   processSequences,
@@ -445,5 +376,3 @@ export {
   enviarMusicaPorWhatsApp,
   retryStuckMusic
 };
-
-

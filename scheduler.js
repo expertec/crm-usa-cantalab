@@ -12,6 +12,8 @@ import ffmpeg from 'fluent-ffmpeg';
 // al inicio de src/server/scheduler.js (o donde esté tu enviarMusicaPorWhatsApp)
 import { sendMessageToLead, sendAudioMessage } from './whatsappService.js';
 import { sendClipMessage } from './whatsappService.js';
+import { enqueueStep, processQueue } from './queue.js';
+
 
 
 
@@ -139,55 +141,9 @@ async function enviarMensaje(lead, mensaje) {
  */
 async function processSequences() {
   try {
-    const leadsSnap = await db
-      .collection('leads')
-      .where('secuenciasActivas', '!=', null)
-      .get();
-
-    for (const doc of leadsSnap.docs) {
-      const lead = { id: doc.id, ...doc.data() };
-      if (!Array.isArray(lead.secuenciasActivas) || !lead.secuenciasActivas.length) continue;
-
-      let dirty = false;
-      for (const seq of lead.secuenciasActivas) {
-        const { trigger, startTime, index } = seq;
-        const seqSnap = await db
-          .collection('secuencias')
-          .where('trigger', '==', trigger)
-          .get();
-        if (seqSnap.empty) continue;
-
-        const msgs = seqSnap.docs[0].data().messages;
-        if (index >= msgs.length) {
-          seq.completed = true;
-          dirty = true;
-          continue;
-        }
-
-        const msg = msgs[index];
-        const sendAt = new Date(startTime).getTime() + msg.delay * 60000;
-        if (Date.now() < sendAt) continue;
-
-        // Enviar y luego registrar en Firestore
-        await enviarMensaje(lead, msg);
-        await db
-          .collection('leads')
-          .doc(lead.id)
-          .collection('messages')
-          .add({
-            content: `Se envió el ${msg.type} de la secuencia ${trigger}`,
-            sender: 'system',
-            timestamp: new Date()
-          });
-
-        seq.index++;
-        dirty = true;
-      }
-
-      if (dirty) {
-        const rem = lead.secuenciasActivas.filter(s => !s.completed);
-        await db.collection('leads').doc(lead.id).update({ secuenciasActivas: rem });
-      }
+    const processed = await processQueue({ batchSize: 100 }); // puedes subir a 200/500 si hay más carga
+    if (processed > 0) {
+      console.log(`✅ processSequences: ${processed} tasks enviados`);
     }
   } catch (err) {
     console.error("Error en processSequences:", err);

@@ -9,7 +9,8 @@ import path from 'path';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 
-import { processQueue, cancelSequenceForLead } from './queue.js';
+
+import { processQueue, cancelSequences } from './queue.js';
 import { sendMessageToLead, sendClipMessage } from './whatsappService.js';
 
 const bucket = admin.storage().bucket();
@@ -81,7 +82,7 @@ async function cancelNuevoLeadForFormLeads({ limit = 300 }) {
     const lead = { id: d.id, ...d.data() };
     if (lead.nuevoLeadCancelled) continue;
 
-    const n = await cancelSequenceForLead({ leadId: lead.id, sequenceId: 'NuevoLead' });
+ const n = await cancelSequences(lead.id, ['NuevoLead']);
     if (n > 0) cancelled += n;
 
     await db.collection('leads').doc(lead.id).set(

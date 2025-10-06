@@ -32,7 +32,13 @@ import {
   enviarMusicaPorWhatsApp,
   retryStuckMusic,
 } from './scheduler.js';
-import { cancelSequenceForLead } from './queue.js';
+import {
+  sendAudioMessage,
+  sendClipMessage,
+  sendFullAudioAsDocument
+} from './whatsappService.js';
+import { scheduleSequenceForLead, cancelSequences } from './queue.js';
+
 
 dotenv.config();
 
@@ -244,7 +250,7 @@ app.post('/api/sequences/enqueue', async (req, res) => {
     await scheduleSequenceForLead(trigger, leadId, leadData);
 
     if (trigger === 'MusicaLead') {
-      const n = await cancelSequenceForLead({ leadId, sequenceId: 'NuevoLead' });
+      const n = await cancelSequences(leadId, ['NuevoLead']);
       if (n > 0) {
         await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
       }

@@ -15,10 +15,14 @@ import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
 
 // ⬇️ Cola de secuencias (usa la versión actual de queue.js)
-import {
-  scheduleSequenceForLead,
-  cancelSequences,
-} from './queue.js';
+
+
+import { scheduleSequenceForLead, cancelSequences } from './queue.js';
+
+
+import { enqueueStep } from './queue.js';      
+import { cancelSequenceForLead } from './queue.js';
+
 
 let latestQR = null;
 let connectionStatus = 'Desconectado';
@@ -175,7 +179,8 @@ export async function connectToWhatsApp() {
             });
 
             // programa secuencia inicial
-            await scheduleSequenceForLead(jid, trigger, new Date());
+          await cancelSequences(leadId, ['NuevoLead']);
+
 
             // si el primer trigger fuera MusicaLead, corta NuevoLead por si acaso
             if (trigger === 'MusicaLead') {

@@ -14,15 +14,8 @@ import axios from 'axios';
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
 
-// ⬇️ Cola de secuencias (usa la versión actual de queue.js)
-
-
+// Cola de secuencias
 import { scheduleSequenceForLead, cancelSequences } from './queue.js';
-
-
-import { enqueueStep } from './queue.js';      
-import { cancelSequenceForLead } from './queue.js';
-
 
 let latestQR = null;
 let connectionStatus = 'Desconectado';
@@ -103,6 +96,7 @@ export async function connectToWhatsApp() {
           if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
           const phone = jid.split('@')[0];
+          const leadId = jid; // usar en todo el flujo
           const sender = msg.key.fromMe ? 'business' : 'lead';
 
           // contenido / media
@@ -152,7 +146,7 @@ export async function connectToWhatsApp() {
           }
 
           // ------- buscar/crear LEAD (docId = jid) -------
-          const leadRef = db.collection('leads').doc(jid);
+          const leadRef = db.collection('leads').doc(leadId);
           const leadSnap = await leadRef.get();
 
           // config global para defaultTrigger
@@ -168,7 +162,7 @@ export async function connectToWhatsApp() {
           };
 
           if (!leadSnap.exists) {
-            // crear lead (sin secuenciasActivas)
+            // crear lead (sin secuenciasActivas en el doc; usamos cola)
             await leadRef.set({
               ...baseLead,
               fecha_creacion: new Date(),
@@ -179,12 +173,11 @@ export async function connectToWhatsApp() {
             });
 
             // programa secuencia inicial
-          await cancelSequences(leadId, ['NuevoLead']);
-
+            await scheduleSequenceForLead(leadId, trigger);
 
             // si el primer trigger fuera MusicaLead, corta NuevoLead por si acaso
             if (trigger === 'MusicaLead') {
-              const cancelled = await cancelSequences(jid, ['NuevoLead']);
+              const cancelled = await cancelSequences(leadId, ['NuevoLead']);
               if (cancelled) {
                 await leadRef.set({ nuevoLeadCancelled: true }, { merge: true });
               }
@@ -202,12 +195,12 @@ export async function connectToWhatsApp() {
 
             // si no tenía esa etiqueta, programa secuencia
             if (!hadTag) {
-              await scheduleSequenceForLead(jid, trigger, new Date());
+              await scheduleSequenceForLead(leadId, trigger);
             }
 
             // si ahora es MusicaLead, cancelar NuevoLead
             if (trigger === 'MusicaLead' && !cur.nuevoLeadCancelled) {
-              const cancelled = await cancelSequences(jid, ['NuevoLead']);
+              const cancelled = await cancelSequences(leadId, ['NuevoLead']);
               if (cancelled) {
                 await leadRef.set({ nuevoLeadCancelled: true }, { merge: true });
               }
@@ -215,7 +208,6 @@ export async function connectToWhatsApp() {
           }
 
           // guardar mensaje en subcolección
-          const leadId = jid;
           const msgData = {
             content,
             mediaType,

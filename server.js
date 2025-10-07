@@ -45,14 +45,15 @@ import {
 } from './scheduler.js';
 
 // 🔹 OpenAI para el mensaje de empatía
-import OpenAI from 'openai';
+import { Configuration, OpenAIApi } from 'openai';
 
 dotenv.config();
 
-// cliente OpenAI
-const openai = new OpenAI({
+const configuration = new Configuration({
   apiKey: process.env.OPENAI_API_KEY
 });
+const openai = new OpenAIApi(configuration);
+
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -307,16 +308,17 @@ mandaremos enseguida. Evita promesas de tiempo exacto. No uses comillas.
 
     let textoEmpatia = '¡Gracias por la info! Estamos creando tu canción y en breve te la enviamos.';
     try {
-      const gpt = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Eres conciso, cálido y natural.' },
-          { role: 'user', content: prompt }
-        ],
-        max_tokens: 120,
-        temperature: 0.7
-      });
-      textoEmpatia = (gpt.choices?.[0]?.message?.content || textoEmpatia).trim();
+     const gpt = await openai.createChatCompletion({
+  model: 'gpt-4o-mini',
+  messages: [
+    { role: 'system', content: 'Eres conciso, cálido y natural.' },
+    { role: 'user', content: prompt }
+  ],
+  max_tokens: 120,
+  temperature: 0.7
+});
+textoEmpatia = (gpt.data.choices?.[0]?.message?.content || textoEmpatia).trim();
+
     } catch (e) {
       console.warn('GPT empatía falló, usando fallback:', e?.message);
     }

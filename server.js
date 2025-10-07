@@ -1,6 +1,7 @@
 // server.js
 import express from 'express';
 import cors from 'cors';
+import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
 import multer from 'multer';
@@ -12,6 +13,12 @@ import axios from 'axios';
 import os from 'os';
 
 import { db, admin } from './firebaseAdmin.js';
+const bucket = admin.storage().bucket();
+
+// ffmpeg binario
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+
+// ⚠️ IMPORTS consolidado de WhatsApp (una sola vez)
 import {
   connectToWhatsApp,
   getLatestQR,
@@ -20,9 +27,13 @@ import {
   sendMessageToLead,
   sendAudioMessage,
   sendClipMessage,
-  sendFullAudioAsDocument,
-  scheduleSequenceForLead,
+  sendFullAudioAsDocument
 } from './whatsappService.js';
+
+// Secuencias (programar/cancelar) → desde queue.js
+import { scheduleSequenceForLead, cancelSequences } from './queue.js';
+
+// Tareas programadas
 import {
   processSequences,
   generarLetraParaMusica,
@@ -30,51 +41,32 @@ import {
   generarMusicaConSuno,
   procesarClips,
   enviarMusicaPorWhatsApp,
-  retryStuckMusic,
+  retryStuckMusic
 } from './scheduler.js';
-import {
-  sendAudioMessage,
-  sendClipMessage,
-  sendFullAudioAsDocument
-} from './whatsappService.js';
-import { scheduleSequenceForLead, cancelSequences } from './queue.js';
-
 
 dotenv.config();
 
-const bucket = admin.storage().bucket();
-
-// Config ffmpeg
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-
-// Express
 const app = express();
 const port = process.env.PORT || 3001;
+const upload = multer({ dest: path.resolve('./uploads') });
 
-// Multer
-const uploadsDir = path.resolve('./uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-const upload = multer({ dest: uploadsDir });
-
-// Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-// ─────────────────────────────────────────────────────────────
-// WhatsApp status
+/* ----------------------- WhatsApp status / número ----------------------- */
 app.get('/api/whatsapp/status', (_req, res) => {
   res.json({ status: getConnectionStatus(), qr: getLatestQR() });
 });
 
 app.get('/api/whatsapp/number', (_req, res) => {
   const phone = getSessionPhone();
-  return phone ? res.json({ phone }) : res.status(503).json({ error: 'WhatsApp no conectado' });
+  if (phone) return res.json({ phone });
+  return res.status(503).json({ error: 'WhatsApp no conectado' });
 });
 
-// ─────────────────────────────────────────────────────────────
-// SUNO callback → sube MP3 completo y marca "Audio listo"
-app.post('/api/suno/callback', async (req, res) => {
-  const raw = req.body;
+/* ----------------------------- Suno callback ---------------------------- */
+app.post('/api/suno/callback', express.json(), async (req, res) => {
+  const raw    = req.body;
   const taskId = raw.taskId || raw.data?.taskId || raw.data?.task_id;
   if (!taskId) return res.sendStatus(400);
 
@@ -84,11 +76,15 @@ app.post('/api/suno/callback', async (req, res) => {
   const audioUrlPrivada = item?.audio_url || item?.source_audio_url;
   if (!audioUrlPrivada) return res.sendStatus(200);
 
-  const snap = await db.collection('musica').where('taskId', '==', taskId).limit(1).get();
+  const snap = await db.collection('musica')
+    .where('taskId', '==', taskId)
+    .limit(1)
+    .get();
   if (snap.empty) return res.sendStatus(404);
   const docRef = snap.docs[0].ref;
 
   try {
+    // Descargar MP3 completo
     const tmpFull = path.join(os.tmpdir(), `${taskId}-full.mp3`);
     const r = await axios.get(audioUrlPrivada, { responseType: 'stream' });
     await new Promise((ok, ko) => {
@@ -98,19 +94,20 @@ app.post('/api/suno/callback', async (req, res) => {
       ws.on('error', ko);
     });
 
+    // Subir a Storage (público)
     const dest = `musica/full/${taskId}.mp3`;
     const [file] = await bucket.upload(tmpFull, {
       destination: dest,
-      metadata: { contentType: 'audio/mpeg' },
+      metadata: { contentType: 'audio/mpeg' }
     });
-
     await file.makePublic();
     const fullUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
 
+    // Actualizar doc
     await docRef.update({
       fullUrl,
       status: 'Audio listo',
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     fs.unlink(tmpFull, () => {});
@@ -122,31 +119,34 @@ app.post('/api/suno/callback', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Botones del panel: enviar canción completa (como clip/doc) o solo clip
+/* ---------------- Envíos manuales (full / clip / texto / audio) --------- */
 app.post('/api/whatsapp/send-full', async (req, res) => {
   const { leadId } = req.body;
-  if (!leadId) return res.status(400).json({ error: 'Falta leadId' });
+  if (!leadId) return res.status(400).json({ error: 'Falta leadId en el body' });
 
   try {
     const leadSnap = await db.collection('leads').doc(leadId).get();
     if (!leadSnap.exists) return res.status(404).json({ error: 'Lead no encontrado' });
     const telefono = String(leadSnap.data().telefono).replace(/\D/g, '');
 
-    const musicSnap = await db.collection('musica').where('leadPhone', '==', telefono).limit(1).get();
+    const musicSnap = await db.collection('musica')
+      .where('leadPhone', '==', telefono)
+      .limit(1)
+      .get();
     if (musicSnap.empty) return res.status(404).json({ error: 'No hay música para este lead' });
 
     const fullUrl = musicSnap.docs[0].data().fullUrl;
     if (!fullUrl) return res.status(400).json({ error: 'fullUrl no disponible' });
 
-    // Puedes cambiar por sendFullAudioAsDocument si prefieres adjunto
-    await sendClipMessage(telefono, fullUrl);
+    await sendClipMessage(telefono, fullUrl); // o sendFullAudioAsDocument(telefono, fullUrl)
 
     await musicSnap.docs[0].ref.update({
       status: 'Enviada completa',
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      sentAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    await db.collection('leads').doc(leadId).update({ estadoProduccion: 'Canción Enviada' });
+    await db.collection('leads').doc(leadId).update({
+      estadoProduccion: 'Canción Enviada'
+    });
 
     return res.json({ success: true });
   } catch (err) {
@@ -157,15 +157,18 @@ app.post('/api/whatsapp/send-full', async (req, res) => {
 
 app.post('/api/whatsapp/send-clip', async (req, res) => {
   const { leadId } = req.body;
-  if (!leadId) return res.status(400).json({ error: 'Falta leadId' });
+  if (!leadId) return res.status(400).json({ error: 'Falta leadId en el body' });
 
   try {
     const leadSnap = await db.collection('leads').doc(leadId).get();
     if (!leadSnap.exists) return res.status(404).json({ error: 'Lead no encontrado' });
     const telefono = String(leadSnap.data().telefono).replace(/\D/g, '');
 
-    const musicSnap = await db.collection('musica').where('leadPhone', '==', telefono).limit(1).get();
-    if (musicSnap.empty) return res.status(404).json({ error: 'No hay clip generado' });
+    const musicSnap = await db.collection('musica')
+      .where('leadPhone', '==', telefono)
+      .limit(1)
+      .get();
+    if (musicSnap.empty) return res.status(404).json({ error: 'No hay clip generado para este lead' });
 
     const { clipUrl } = musicSnap.docs[0].data();
     if (!clipUrl) return res.status(400).json({ error: 'Clip aún no disponible' });
@@ -174,7 +177,7 @@ app.post('/api/whatsapp/send-clip', async (req, res) => {
 
     await musicSnap.docs[0].ref.update({
       status: 'Enviado por botón',
-      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      sentAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     return res.json({ success: true });
@@ -184,16 +187,17 @@ app.post('/api/whatsapp/send-clip', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Enviar mensaje manual
 app.post('/api/whatsapp/send-message', async (req, res) => {
   const { leadId, message } = req.body;
-  if (!leadId || !message) return res.status(400).json({ error: 'Faltan leadId o message' });
+  if (!leadId || !message) {
+    return res.status(400).json({ error: 'Faltan leadId o message en el body' });
+  }
 
   try {
-    const leadDoc = await db.collection('leads').doc(leadId).get();
-    if (!leadDoc.exists) return res.status(404).json({ error: 'Lead no encontrado' });
-    const { telefono } = leadDoc.data();
+    const leadSnap = await db.collection('leads').doc(leadId).get();
+    if (!leadSnap.exists) return res.status(404).json({ error: 'Lead no encontrado' });
+
+    const { telefono } = leadSnap.data();
     if (!telefono) return res.status(400).json({ error: 'Lead sin número de teléfono' });
 
     const result = await sendMessageToLead(telefono, message);
@@ -204,8 +208,6 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Subir audio (webm/opus), convertir a M4A/AAC y enviarlo como PTT
 app.post('/api/whatsapp/send-audio', upload.single('audio'), async (req, res) => {
   const { phone } = req.body;
   const uploadPath = req.file.path;
@@ -222,7 +224,6 @@ app.post('/api/whatsapp/send-audio', upload.single('audio'), async (req, res) =>
     });
 
     await sendAudioMessage(phone, m4aPath);
-
     fs.unlinkSync(uploadPath);
     fs.unlinkSync(m4aPath);
 
@@ -235,8 +236,7 @@ app.post('/api/whatsapp/send-audio', upload.single('audio'), async (req, res) =>
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Encolar secuencia desde el panel (frontend)
+/* ---------------------- API para encolar secuencias --------------------- */
 app.post('/api/sequences/enqueue', async (req, res) => {
   try {
     const { leadId, trigger } = req.body; // leadId = "<e164>@s.whatsapp.net"
@@ -244,11 +244,13 @@ app.post('/api/sequences/enqueue', async (req, res) => {
       return res.status(400).json({ error: 'leadId y trigger son requeridos' });
     }
 
-    const snap = await db.collection('leads').doc(leadId).get();
-    const leadData = snap.exists ? snap.data() : {};
+    // placeholders (si quieres personalizar {{nombre}} etc)
+    const leadSnap = await db.collection('leads').doc(leadId).get();
+    const leadData = leadSnap.exists ? leadSnap.data() : {};
 
-    await scheduleSequenceForLead(trigger, leadId, leadData);
+    await scheduleSequenceForLead(leadId, trigger, new Date());
 
+    // Si es MusicaLead, cancela recordatorios de captación
     if (trigger === 'MusicaLead') {
       const n = await cancelSequences(leadId, ['NuevoLead']);
       if (n > 0) {
@@ -263,11 +265,10 @@ app.post('/api/sequences/enqueue', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// Marcar mensajes como leídos (solo contador)
+/* ----------------------- Marcar como leídos (UI) ------------------------ */
 app.post('/api/whatsapp/mark-read', async (req, res) => {
   const { leadId } = req.body;
-  if (!leadId) return res.status(400).json({ error: 'Falta leadId' });
+  if (!leadId) return res.status(400).json({ error: 'Falta leadId en el body' });
 
   try {
     await db.collection('leads').doc(leadId).update({ unreadCount: 0 });
@@ -278,23 +279,21 @@ app.post('/api/whatsapp/mark-read', async (req, res) => {
   }
 });
 
-// Healthcheck opcional
-app.get('/', (_req, res) => res.send('OK'));
-
-// ─────────────────────────────────────────────────────────────
-// Start + conectar WhatsApp
+/* ------------------- Arranque + conexión WhatsApp ----------------------- */
 app.listen(port, () => {
   console.log(`Servidor corriendo en el puerto ${port}`);
-  connectToWhatsApp().catch(err => console.error('Error al conectar WhatsApp en startup:', err));
+  connectToWhatsApp().catch(err =>
+    console.error('Error al conectar WhatsApp en startup:', err)
+  );
 });
 
-// ─────────────────────────────────────────────────────────────
-// CRON
+/* ----------------------------- CRON JOBS -------------------------------- */
 cron.schedule('*/30 * * * * *', () => {
   console.log('⏱️ processSequences:', new Date().toISOString());
   processSequences().catch(err => console.error('Error en processSequences:', err));
 });
 
+// Música
 cron.schedule('*/1 * * * *', generarLetraParaMusica);
 cron.schedule('*/1 * * * *', generarPromptParaMusica);
 cron.schedule('*/2 * * * *', generarMusicaConSuno);

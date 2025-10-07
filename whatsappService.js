@@ -14,7 +14,7 @@ import axios from 'axios';
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
 
-// Cola de secuencias
+// Cola de secuencias (versión nueva en queue.js)
 import { scheduleSequenceForLead, cancelSequences } from './queue.js';
 
 let latestQR = null;
@@ -26,7 +26,7 @@ const localAuthFolder = '/var/data';
 const { FieldValue } = admin.firestore;
 const bucket = admin.storage().bucket();
 
-/* util */
+/* ------------------------------ helpers ------------------------------ */
 function firstName(n = '') {
   return String(n).trim().split(/\s+/)[0] || '';
 }
@@ -52,11 +52,12 @@ export async function connectToWhatsApp() {
     const sock = makeWASocket({
       auth: state,
       logger: Pino({ level: 'info' }),
-      printQRInTerminal: true, // (aviso deprecado de Baileys; OK por ahora)
+      printQRInTerminal: true,
       version,
     });
     whatsappSock = sock;
 
+    // ── eventos de conexión
     sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
       if (qr) {
         latestQR = qr;
@@ -72,13 +73,13 @@ export async function connectToWhatsApp() {
         const reason = lastDisconnect?.error?.output?.statusCode;
         connectionStatus = 'Desconectado';
         if (reason === DisconnectReason.loggedOut) {
-          // limpiar sesión
-          fs.readdirSync(localAuthFolder).forEach(f => {
+          // limpiar sesión local y forzar re-login
+          for (const f of fs.readdirSync(localAuthFolder)) {
             fs.rmSync(path.join(localAuthFolder, f), { force: true, recursive: true });
-          });
+          }
           sessionPhone = null;
         }
-        // reintento
+        // reintento automático
         connectToWhatsApp();
       }
     });
@@ -96,7 +97,7 @@ export async function connectToWhatsApp() {
           if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
           const phone = jid.split('@')[0];
-          const leadId = jid; // usar en todo el flujo
+          const leadId = jid;
           const sender = msg.key.fromMe ? 'business' : 'lead';
 
           // contenido / media
@@ -153,16 +154,18 @@ export async function connectToWhatsApp() {
           const cfgSnap = await db.collection('config').doc('appConfig').get();
           const cfg = cfgSnap.exists ? cfgSnap.data() : {};
           let trigger =
-            content.includes('#webPro1490') ? 'LeadWeb1490' : (cfg.defaultTrigger || 'NuevoLead');
+            content.includes('#webPro1490')
+              ? 'LeadWeb1490'
+              : (cfg.defaultTrigger || 'NuevoLead');
 
           const baseLead = {
-            telefono: phone,
+            telefono: phone,                // almacenamos E164 sin '+'
             nombre: msg.pushName || '',
             source: 'WhatsApp',
           };
 
           if (!leadSnap.exists) {
-            // crear lead (sin secuenciasActivas en el doc; usamos cola)
+            // crear lead (sin guardar secuencias en el doc; usamos la cola)
             await leadRef.set({
               ...baseLead,
               fecha_creacion: new Date(),
@@ -175,7 +178,7 @@ export async function connectToWhatsApp() {
             // programa secuencia inicial
             await scheduleSequenceForLead(leadId, trigger);
 
-            // si el primer trigger fuera MusicaLead, corta NuevoLead por si acaso
+            // si el trigger inicial fuera MusicaLead, cancela recordatorios
             if (trigger === 'MusicaLead') {
               const cancelled = await cancelSequences(leadId, ['NuevoLead']);
               if (cancelled) {
@@ -198,7 +201,7 @@ export async function connectToWhatsApp() {
               await scheduleSequenceForLead(leadId, trigger);
             }
 
-            // si ahora es MusicaLead, cancelar NuevoLead
+            // si ahora es MusicaLead, cancela captación
             if (trigger === 'MusicaLead' && !cur.nuevoLeadCancelled) {
               const cancelled = await cancelSequences(leadId, ['NuevoLead']);
               if (cancelled) {

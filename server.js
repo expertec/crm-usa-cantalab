@@ -18,7 +18,7 @@ const bucket = admin.storage().bucket();
 // ffmpeg binario
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
-// ⚠️ IMPORTS consolidado de WhatsApp (una sola vez)
+// ⚠️ IMPORTS de WhatsApp (una sola vez)
 import {
   connectToWhatsApp,
   getLatestQR,
@@ -44,7 +44,15 @@ import {
   retryStuckMusic
 } from './scheduler.js';
 
+// 🔹 OpenAI para el mensaje de empatía
+import OpenAI from 'openai';
+
 dotenv.config();
+
+// cliente OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -244,10 +252,6 @@ app.post('/api/sequences/enqueue', async (req, res) => {
       return res.status(400).json({ error: 'leadId y trigger son requeridos' });
     }
 
-    // placeholders (si quieres personalizar {{nombre}} etc)
-    const leadSnap = await db.collection('leads').doc(leadId).get();
-    const leadData = leadSnap.exists ? leadSnap.data() : {};
-
     await scheduleSequenceForLead(leadId, trigger, new Date());
 
     // Si es MusicaLead, cancela recordatorios de captación
@@ -261,6 +265,71 @@ app.post('/api/sequences/enqueue', async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error('enqueue error:', e);
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+/* --------------------- POST formulario → flujo completo ----------------- */
+// Corta "NuevoLead", genera/manda empatía (GPT) y encola "MusicaLead"
+app.post('/api/lead/after-form', async (req, res) => {
+  try {
+    const { leadId, summary } = req.body; // summary: { nombre, proposito, genero, artista, anecdotas, requesterName }
+    if (!leadId || !summary) {
+      return res.status(400).json({ error: 'leadId y summary son requeridos' });
+    }
+
+    // traer lead (teléfono)
+    const leadSnap = await db.collection('leads').doc(leadId).get();
+    if (!leadSnap.exists) return res.status(404).json({ error: 'Lead no encontrado' });
+    const lead = leadSnap.data();
+    const phone = String(lead.telefono || '').replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'Lead sin teléfono' });
+
+    // 1) Cancelar recordatorios de captación
+    await cancelSequences(leadId, ['NuevoLead']);
+    await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
+
+    // 2) Mensaje de empatía con GPT
+    const prompt = `
+Eres un asistente empático que escribe un mensaje breve (máx 2 frases),
+en español informal, para WhatsApp. Habla en segunda persona y nombra por su
+primer nombre si está disponible. Contexto:
+
+- Nombre del cliente: ${summary?.nombre || lead?.nombre || ''}
+- Propósito: ${summary?.proposito || ''}
+- Género musical deseado: ${summary?.genero || ''}
+- Artista de referencia: ${summary?.artista || ''}
+- Anécdotas: ${summary?.anecdotas || ''}
+
+Objetivo: inspirar confianza y avisar que ya estamos creando la canción y se la
+mandaremos enseguida. Evita promesas de tiempo exacto. No uses comillas.
+    `.trim();
+
+    let textoEmpatia = '¡Gracias por la info! Estamos creando tu canción y en breve te la enviamos.';
+    try {
+      const gpt = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Eres conciso, cálido y natural.' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 120,
+        temperature: 0.7
+      });
+      textoEmpatia = (gpt.choices?.[0]?.message?.content || textoEmpatia).trim();
+    } catch (e) {
+      console.warn('GPT empatía falló, usando fallback:', e?.message);
+    }
+
+    // 3) Enviar mensaje de empatía
+    await sendMessageToLead(phone, textoEmpatia);
+
+    // 4) Encolar MusicaLead (editable desde tu panel)
+    await scheduleSequenceForLead(leadId, 'MusicaLead', new Date());
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('/api/lead/after-form error:', e);
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });

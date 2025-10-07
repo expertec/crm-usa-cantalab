@@ -319,19 +319,16 @@ async function procesarClips() {
 }
 
 // 5) Enviar letra + clip a WhatsApp y marcar Enviada
+// 5) Enviar letra + link de escucha a WhatsApp y marcar Enviada
 async function enviarMusicaPorWhatsApp() {
-  const snap = await db.collection('musica')
-    .where('status', '==', 'Enviar música')
-    .get();
-
+  const snap = await db.collection('musica').where('status', '==', 'Enviar música').get();
   if (snap.empty) return;
 
   for (const doc of snap.docs) {
-    const { leadId, leadPhone, lyrics, clipUrl } = doc.data();
+    const { leadId, leadPhone, lyrics } = doc.data();
     const ref = doc.ref;
 
-    // Validaciones
-    if (!leadPhone || !lyrics || !clipUrl) {
+    if (!leadPhone || !lyrics) {
       console.warn(`[${doc.id}] faltan datos, status sigue 'Enviar música'`);
       continue;
     }
@@ -345,19 +342,23 @@ async function enviarMusicaPorWhatsApp() {
         : `Esta es la letra:\n\n${lyrics}`;
       await sendMessageToLead(leadPhone, saludo);
 
-      // 2) Texto de preámbulo
-      await sendMessageToLead(leadPhone, '¿Cómo la ves? Ahora escucha el clip.');
+      // 2) Generar link de escucha
+      const listenUrl = `https://cantalab.com/escuchar/${leadPhone}`;
 
-      // 3) Audio inline desde URL
-      await sendClipMessage(leadPhone, clipUrl);
+      // 3) Enviar mensaje con link
+      await sendMessageToLead(
+        leadPhone,
+        `🎧 Ya tenemos tu canción lista.\n\nEscúchala aquí:\n${listenUrl}\n\n⚠️ El acceso es limitado, guárdalo bien.`
+      );
 
-      // 4) Marcar como enviado
+      // 4) Marcar como enviada en Firestore
       await ref.update({
         status: 'Enviada',
+        listenUrl,
         sentAt: FieldValue.serverTimestamp()
       });
 
-      // 5) Etiqueta informativa (no activa secuencia)
+      // (opcional) Etiqueta informativa
       if (leadId) {
         await db.collection('leads').doc(leadId).set(
           { etiquetas: admin.firestore.FieldValue.arrayUnion('CancionEnviada') },
@@ -372,6 +373,7 @@ async function enviarMusicaPorWhatsApp() {
     }
   }
 }
+
 
 // 6) Reintento de stuck (Suno)
 async function retryStuckMusic(thresholdMin = 10) {

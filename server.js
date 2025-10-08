@@ -372,69 +372,47 @@ app.post('/api/lead/after-form', async (req, res) => {
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
 
-   // 2) Mensaje de empatía (tono personal, sin “acabo de leer…”, con cierre fijo)
-const nombre      = (summary?.nombre || lead?.nombre || '').toString().trim();
-const firstName   = (nombre || '').split(/\s+/)[0] || '';
-const anecdotesRaw= (summary?.anecdotes || '').toString().trim();  // del formulario (anecdotes)
-const genre       = (summary?.genre || '').toString().trim();      // opcional
-const artist      = (summary?.artist || '').toString().trim();     // opcional
+   // 2) Mensaje de empatía (determinístico, sin GPT, sin “:”, suena a voz propia)
+const nombre       = (summary?.nombre || lead?.nombre || '').toString().trim();
+const firstName    = (nombre || '').split(/\s+/)[0] || '';
+const anecdotesRaw = (summary?.anecdotes || summary?.anecdotas || '').toString().trim(); // usa el campo real
+const cierreFijo   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
 
-const cierreFijo  = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
-
+// Helpers
 function clean(s) {
   return String(s || '')
-    .replace(/[“”"']/g, '')  // sin comillas
+    .replace(/[“”"']/g, '')   // sin comillas
     .replace(/\s+/g, ' ')
     .trim();
 }
-
-// recorte suave por si la anécdota es larguísima
-function shorten(s, max = 140) {
-  let t = clean(s);
-  if (t.length <= max) return t;
-  const cut = t.slice(0, max);
-  const last = Math.max(cut.lastIndexOf('.'), cut.lastIndexOf('!'), cut.lastIndexOf('?'), cut.lastIndexOf(',')); 
-  return clean((last > 40 ? cut.slice(0, last) : cut) + '…');
+function shortenByWords(s, maxWords = 45) {
+  const words = clean(s).split(/\s+/);
+  if (words.length <= maxWords) return clean(s);
+  return clean(words.slice(0, maxWords).join(' ') + '…');
+}
+function sentenceCase(s) {
+  const t = clean(s);
+  if (!t) return '';
+  return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-// Fallback determinístico (SIN dos puntos, suena a mensaje tuyo)
-function fallbackEmpatia() {
-  if (anecdotesRaw) {
-    const fragmento = shorten(anecdotesRaw, 160);
-    const saludo = firstName ? `${firstName}, ` : '';
-    return clean(`${saludo}me llega mucho lo que cuentas de ${fragmento}. ${cierreFijo}`);
-  }
+// Construcción sin dos puntos y en tono personal
+let textoEmpatia;
+if (anecdotesRaw) {
+  const frag = sentenceCase(shortenByWords(anecdotesRaw, 45)); // recorta si es muy largo
   const saludo = firstName ? `${firstName}, ` : '';
-  return clean(`${saludo}gracias por la información, ya estoy trabajando en tu canción. ${cierreFijo}`);
-}
-
-let textoEmpatia = fallbackEmpatia();
-
-try {
-  // Intento de versión más compacta con GPT (≤18 palabras) SIN prefijos tipo "acabo de leer"
-  const { text } = await chatCompletionCompat({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: 'Redacta una sola cláusula natural (≤18 palabras), sin comillas ni emojis, que resuma la anécdota tal cual, sin inventar.' },
-      { role: 'user', content: `Anécdota del cliente: ${anecdotesRaw || '(sin anécdota)'}\n\nEscribe SOLO la cláusula, empezando directo (no empieces con “acabo de leer…” ni “tu historia…”).` }
-    ],
-    max_tokens: 60,
-    temperature: 0.2
-  });
-
-  const clausula = clean(text);
-  if (clausula) {
-    const saludo = firstName ? `${firstName}, ` : '';
-    // opcional: género o artista si existen y ayudan (muy breve)
-    const extra = genre ? ` en el estilo ${genre}` : '';
-    textoEmpatia = clean(`${saludo}${clausula}${extra}. ${cierreFijo}`);
-  }
-} catch (e) {
-  console.warn('Resumen anécdota (GPT) falló, uso fallback:', e?.message);
+  // Ejemplos resultantes:
+  // "Sergio, me conmovió lo que cuentas de ... Voy a poner todo de mí ..."
+  // "Sergio, qué especial lo que compartes sobre ... Voy a poner todo de mí ..."
+  textoEmpatia = clean(`${saludo}me conmovió lo que compartes sobre ${frag}. ${cierreFijo}`);
+} else {
+  const saludo = firstName ? `${firstName}, ` : '';
+  textoEmpatia = clean(`${saludo}gracias por la información, ya estoy trabajando en tu canción. ${cierreFijo}`);
 }
 
 // 3) Enviar mensaje de empatía
 await sendMessageToLead(phone, textoEmpatia);
+
 
 
 

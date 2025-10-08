@@ -44,16 +44,98 @@ import {
   retryStuckMusic
 } from './scheduler.js';
 
-// 🔹 OpenAI para el mensaje de empatía
-import { Configuration, OpenAIApi } from 'openai';
+// 🔹 OpenAI (lazy + compat v3/v4 + responses API)
+import OpenAIImport from 'openai';
 
 dotenv.config();
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY
-});
-const openai = new OpenAIApi(configuration);
+/* ========================= OpenAI helpers robustos ========================= */
+function assertOpenAIKey() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Falta la variable de entorno OPENAI_API_KEY');
+  }
+}
 
+// En algunas instalaciones, el paquete exporta { OpenAI }, en otras el ctor por default
+const OpenAICtor = OpenAIImport?.OpenAI || OpenAIImport;
+
+/** Devuelve un cliente y el “modo” detectado */
+async function getOpenAI() {
+  assertOpenAIKey();
+  try {
+    const client = new OpenAICtor({ apiKey: process.env.OPENAI_API_KEY });
+
+    // Detectar capacidades presentes
+    const hasChatCompletions = !!client?.chat?.completions?.create;
+    const hasResponses = !!client?.responses?.create;
+
+    if (hasChatCompletions) return { client, mode: 'v4-chat' };
+    if (hasResponses) return { client, mode: 'v4-responses' };
+  } catch {
+    // cae a v3
+  }
+
+  // Fallback v3 (openai@3)
+  const { Configuration, OpenAIApi } = await import('openai');
+  const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
+  const client = new OpenAIApi(configuration);
+  return { client, mode: 'v3' };
+}
+
+/** Extrae texto de respuesta para cualquier modo */
+function extractTextFromAny(resp, mode) {
+  try {
+    if (mode === 'v4-chat') {
+      return resp?.choices?.[0]?.message?.content?.trim() || '';
+    }
+    if (mode === 'v4-responses') {
+      // Algunas versiones traen .output_text, otras hay que juntar los items
+      if (resp?.output_text) return String(resp.output_text).trim();
+      // fallback: juntar fragmentos
+      const parts = [];
+      const content = resp?.output || resp?.content || [];
+      for (const item of content) {
+        if (typeof item === 'string') parts.push(item);
+        else if (Array.isArray(item?.content)) {
+          for (const c of item.content) {
+            if (c?.text?.value) parts.push(c.text.value);
+          }
+        } else if (item?.text?.value) {
+          parts.push(item.text.value);
+        }
+      }
+      return parts.join(' ').trim();
+    }
+    // v3
+    return resp?.data?.choices?.[0]?.message?.content?.trim() || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Wrapper unificado para pedir una completion estilo chat */
+async function chatCompletionCompat({ model, messages, max_tokens = 200, temperature = 0.7 }) {
+  const { client, mode } = await getOpenAI();
+
+  if (mode === 'v4-chat') {
+    const resp = await client.chat.completions.create({ model, messages, max_tokens, temperature });
+    return { text: extractTextFromAny(resp, mode), raw: resp, mode };
+  }
+
+  if (mode === 'v4-responses') {
+    // responses.create usa un esquema distinto: input como “contenido”
+    const resp = await client.responses.create({
+      model,
+      input: messages?.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n')
+    });
+    return { text: extractTextFromAny(resp, mode), raw: resp, mode };
+  }
+
+  // v3
+  const resp = await client.createChatCompletion({ model, messages, max_tokens, temperature });
+  return { text: extractTextFromAny(resp, 'v3'), raw: resp, mode: 'v3' };
+}
+/* ======================================================================== */
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -248,7 +330,7 @@ app.post('/api/whatsapp/send-audio', upload.single('audio'), async (req, res) =>
 /* ---------------------- API para encolar secuencias --------------------- */
 app.post('/api/sequences/enqueue', async (req, res) => {
   try {
-    const { leadId, trigger } = req.body; // leadId = "<e164>@s.whatsapp.net"
+    const { leadId, trigger } = req.body; // leadId = "<e164>@s.whatsapp.net" o "521..."
     if (!leadId || !trigger) {
       return res.status(400).json({ error: 'leadId y trigger son requeridos' });
     }
@@ -290,7 +372,7 @@ app.post('/api/lead/after-form', async (req, res) => {
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
 
-    // 2) Mensaje de empatía con GPT
+    // 2) Mensaje de empatía con GPT (compat)
     const prompt = `
 Eres un asistente empático que escribe un mensaje breve (máx 2 frases),
 en español informal, para WhatsApp. Habla en segunda persona y nombra por su
@@ -308,24 +390,17 @@ mandaremos enseguida. Evita promesas de tiempo exacto. No uses comillas.
 
     let textoEmpatia = '¡Gracias por la info! Estamos creando tu canción y en breve te la enviamos.';
     try {
-     const gpt = await openai.chat.completions.create({
-  model: 'gpt-4o-mini',
-  messages: [
-    { role: 'system', content: 'Eres conciso, cálido y natural.' },
-    { role: 'user', content: prompt }
-  ],
-  max_tokens: 120,
-  temperature: 0.7
-});
-
-const resp = gpt.choices?.[0]?.message?.content;
-if (resp) {
-  textoEmpatia = resp.trim();
-} else {
-  textoEmpatia = `¡Gracias ${summary?.nombre || lead?.nombre || ''}! Estamos creando tu canción 🎵✨`;
-}
-
-
+      const { text, mode } = await chatCompletionCompat({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Eres conciso, cálido y natural.' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 120,
+        temperature: 0.7
+      });
+      if (text) textoEmpatia = text;
+      console.log('[GPT empatía] modo:', mode, '→', textoEmpatia);
     } catch (e) {
       console.warn('GPT empatía falló, usando fallback:', e?.message);
     }

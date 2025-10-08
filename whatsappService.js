@@ -375,3 +375,37 @@ export async function sendClipMessage(phone, clipUrl) {
     }
   }
 }
+
+export async function sendVideoNote(phone, videoUrlOrPath) {
+  const sock = getWhatsAppSock();
+  if (!sock) throw new Error('No hay conexión activa con WhatsApp');
+
+  let num = String(phone).replace(/\D/g, '');
+  if (num.length === 10) num = '52' + num; // normaliza MX si aplica
+  const jid = `${num}@s.whatsapp.net`;
+
+  // WhatsApp “video note”: ptv: true  (video redondo)
+  // acepta Buffer o { url }
+  const content =
+    videoUrlOrPath.startsWith('http')
+      ? { video: { url: videoUrlOrPath }, ptv: true }
+      : { video: fs.readFileSync(videoUrlOrPath), ptv: true };
+
+  await sock.sendMessage(jid, content, { timeoutMs: 120_000 });
+
+  // (Opcional) persistir en Firestore si ya existe lead
+  const q = await db.collection('leads').where('telefono', '==', num).limit(1).get();
+  if (!q.empty) {
+    const leadId = q.docs[0].id;
+    const msgData = {
+      content: '',
+      mediaType: 'video_note',
+      mediaUrl: videoUrlOrPath.startsWith('http') ? videoUrlOrPath : null,
+      sender: 'business',
+      timestamp: new Date()
+    };
+    await db.collection('leads').doc(leadId).collection('messages').add(msgData);
+    await db.collection('leads').doc(leadId).update({ lastMessageAt: msgData.timestamp });
+  }
+}
+

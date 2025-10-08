@@ -3,7 +3,8 @@ import { db, admin } from './firebaseAdmin.js';
 import {
   sendMessageToLead,
   sendClipMessage,
-  getWhatsAppSock
+  getWhatsAppSock,
+  sendVideoNote   
 } from './whatsappService.js';
 
 const { FieldValue } = admin.firestore;
@@ -171,6 +172,14 @@ async function deliverPayload(leadId, payload) {
       } else if (url) {
         await sendMessageToLead(phone, url);
       }
+      break;
+    }
+
+      // NUEVO: video note (video redondo)
+    case 'videonota':
+    case 'video_note': {
+      const url = replacePlaceholders(contenido, lead).trim();
+      if (url) await sendVideoNote(phone, url);
       break;
     }
 

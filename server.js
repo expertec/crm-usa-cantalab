@@ -372,90 +372,70 @@ app.post('/api/lead/after-form', async (req, res) => {
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
 
-   // 2) Mensaje de empatía (centrado en anecdotes) + cierre fijo
+   // 2) Mensaje de empatía (tono personal, sin “acabo de leer…”, con cierre fijo)
 const nombre      = (summary?.nombre || lead?.nombre || '').toString().trim();
 const firstName   = (nombre || '').split(/\s+/)[0] || '';
-const anecdotes   = (summary?.anecdotes || '').toString().trim();  // <— del formulario real
-const genre       = (summary?.genre || '').toString().trim();      // <— del formulario real
-const artist      = (summary?.artist || '').toString().trim();     // <— del formulario real
+const anecdotesRaw= (summary?.anecdotes || '').toString().trim();  // del formulario (anecdotes)
+const genre       = (summary?.genre || '').toString().trim();      // opcional
+const artist      = (summary?.artist || '').toString().trim();     // opcional
 
-const hayAnecdota = anecdotes.length > 0;
+const cierreFijo  = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
 
-const reglas = `
-Escribe un mensaje de WhatsApp en español, de 1 o 2 frases, cálido y natural.
-1) Saluda por el primer nombre si existe ("${firstName}").
-2) Comenta empáticamente SOBRE LA ANÉCDOTA exactamente como está (no inventes).
-3) Puedes mencionar el género "${genre}" de forma breve, solo si ayuda.
-4) Menciona un artista SOLO si viene explícito ("${artist}"); si no, no lo inventes.
-5) Sin comillas, emojis ni hashtags.
-6) La segunda frase debe ser EXACTAMENTE: "Voy a poner todo de mí para hacer esta canción; enseguida te la envío."
-`.trim();
-
-const contexto = `
-Nombre: ${firstName || '(sin nombre)'}
-Anécdota: ${hayAnecdota ? anecdotes : '(sin anécdota)'}
-Género: ${genre || '(sin género)'}
-Artista: ${artist || '(sin artista)'}
-`.trim();
-
-const promptEmpatia = `
-${reglas}
-
-Objetivo: confirmar que recibimos su información y reflejar la anécdota con empatía.
-
-Contexto del cliente:
-${contexto}
-
-Redacta el mensaje final (sin comillas).
-`.trim();
-
-let textoEmpatia =
-  '¡Gracias por tu información! Ya estoy trabajando en tu canción. ' +
-  'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
-
-function sanitize(txt) {
-  const cierreFijo = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
-  let out = String(txt || '')
-    .replace(/[“”"]+/g, '')     // sin comillas
+function clean(s) {
+  return String(s || '')
+    .replace(/[“”"']/g, '')  // sin comillas
     .replace(/\s+/g, ' ')
     .trim();
-
-  // Fuerza cierre fijo como segunda frase
-  if (out) {
-    const primera = out.split(/(?<=[.!?])\s+/)[0] || out;
-    out = `${primera} ${cierreFijo}`;
-  } else {
-    out = cierreFijo;
-  }
-
-  // Si no hay anécdota, evita frases que finjan detalles
-  if (!hayAnecdota) {
-    out = out.replace(/\b(inspirad[oa]\s+en|basad[oa]\s+en|sobre\s+la\s+historia\s+de)\b.*?(?=[.!]|$)/gi, '').trim();
-    if (!out.endsWith(cierreFijo)) out = `${out} ${cierreFijo}`;
-  }
-
-  return out.length > 280 ? out.slice(0, 280).trim() : out;
 }
 
+// recorte suave por si la anécdota es larguísima
+function shorten(s, max = 140) {
+  let t = clean(s);
+  if (t.length <= max) return t;
+  const cut = t.slice(0, max);
+  const last = Math.max(cut.lastIndexOf('.'), cut.lastIndexOf('!'), cut.lastIndexOf('?'), cut.lastIndexOf(',')); 
+  return clean((last > 40 ? cut.slice(0, last) : cut) + '…');
+}
+
+// Fallback determinístico (SIN dos puntos, suena a mensaje tuyo)
+function fallbackEmpatia() {
+  if (anecdotesRaw) {
+    const fragmento = shorten(anecdotesRaw, 160);
+    const saludo = firstName ? `${firstName}, ` : '';
+    return clean(`${saludo}me llega mucho lo que cuentas de ${fragmento}. ${cierreFijo}`);
+  }
+  const saludo = firstName ? `${firstName}, ` : '';
+  return clean(`${saludo}gracias por la información, ya estoy trabajando en tu canción. ${cierreFijo}`);
+}
+
+let textoEmpatia = fallbackEmpatia();
+
 try {
+  // Intento de versión más compacta con GPT (≤18 palabras) SIN prefijos tipo "acabo de leer"
   const { text } = await chatCompletionCompat({
     model: 'gpt-4o-mini',
     messages: [
-      { role: 'system', content: 'Eres conciso, cálido y natural. Cumple estrictamente las reglas.' },
-      { role: 'user', content: promptEmpatia }
+      { role: 'system', content: 'Redacta una sola cláusula natural (≤18 palabras), sin comillas ni emojis, que resuma la anécdota tal cual, sin inventar.' },
+      { role: 'user', content: `Anécdota del cliente: ${anecdotesRaw || '(sin anécdota)'}\n\nEscribe SOLO la cláusula, empezando directo (no empieces con “acabo de leer…” ni “tu historia…”).` }
     ],
-    max_tokens: 140,
-    temperature: 0.4
+    max_tokens: 60,
+    temperature: 0.2
   });
-  const limpio = sanitize(text);
-  if (limpio) textoEmpatia = limpio;
-  console.log('[GPT empatía] →', textoEmpatia);
+
+  const clausula = clean(text);
+  if (clausula) {
+    const saludo = firstName ? `${firstName}, ` : '';
+    // opcional: género o artista si existen y ayudan (muy breve)
+    const extra = genre ? ` en el estilo ${genre}` : '';
+    textoEmpatia = clean(`${saludo}${clausula}${extra}. ${cierreFijo}`);
+  }
 } catch (e) {
-  console.warn('GPT empatía falló, usando fallback:', e?.message);
+  console.warn('Resumen anécdota (GPT) falló, uso fallback:', e?.message);
 }
 
 // 3) Enviar mensaje de empatía
 await sendMessageToLead(phone, textoEmpatia);
+
 
 
     // 4) Encolar MusicaLead (editable desde tu panel)

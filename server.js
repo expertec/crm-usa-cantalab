@@ -371,123 +371,90 @@ app.post('/api/lead/after-form', async (req, res) => {
     // 1) Cancelar recordatorios de captación
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
-// 2) Mensaje de empatía (personalizado por lead; extractivo; sin inventar)
-const nombre       = (summary?.nombre || lead?.nombre || '').toString().trim();
-const firstName    = (nombre || '').split(/\s+/)[0] || '';
-const rawAnecdote  = (summary?.anecdotes || summary?.anecdotas || '').toString().trim();
-const genre        = (summary?.genre || '').toString().trim();   // opcional
-const artist       = (summary?.artist || '').toString().trim();  // opcional
-const cierreFijo   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
+
+
+
+    // 2) Mensaje de empatía (HECHO por GPT: interpretación + tono humano, sin “:”, 1 frase + cierre)
+const requesterName = (summary?.requesterName || '').toString().trim(); // quien recibirá el WhatsApp
+const firstName     = requesterName.split(/\s+/)[0] || '';
+const anecdotes     = (summary?.anecdotes || summary?.anecdotas || '').toString().trim();
+const genre         = (summary?.genre || '').toString().trim();
+const artist        = (summary?.artist || '').toString().trim();
+
+const CIERRE_FIJO   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
 
 function clean(s) {
   return String(s || '').replace(/[“”"']/g, '').replace(/\s+/g, ' ').trim();
 }
-function cap(s) {
-  const t = clean(s); return t ? t[0].toUpperCase() + t.slice(1) : '';
-}
-function joinHuman(arr) {
-  if (!arr?.length) return '';
-  if (arr.length === 1) return arr[0];
-  if (arr.length === 2) return `${arr[0]} y ${arr[1]}`;
-  return `${arr.slice(0,-1).join(', ')} y ${arr.at(-1)}`;
+function forceClose(text) {
+  // Asegura 1 frase principal + cierre fijo (sin “:”)
+  const t = clean(text).replace(/\s*:\s*/g, ', ');
+  // toma solo la primera oración/segmento razonable
+  const primera = t.split(/(?<=[.!?])\s+/)[0] || t;
+  return clean(`${primera} ${CIERRE_FIJO}`);
 }
 
-// --- 1) Intento: extracción estructurada con GPT en modo “no inventes” ---
-async function extractFacts(texto) {
-  const prompt = `
-Devuelve SOLO JSON con este esquema exacto y en español:
-{
-  "personas": ["..."],        // 0-3 nombres/frases tal como aparecen (ej: "tu tocayo Sergio Pérez")
-  "momentos": ["..."],        // 1-3 momentos de la historia, cada uno ≤ 7 palabras, sin inventar
-  "intencion": "..."          // 3-10 palabras, p.ej. "querer apoyarlo con esta canción"
-}
-REGLAS:
-- Cita exactamente lo escrito (no inventes detalles).
-- Momentos: máximo 3, ≤7 palabras cada uno.
-- Si no ves intención explícita, deja "intencion": "".
-Anécdota:
-${texto}
-  `.trim();
+let textoEmpatia = `${firstName ? firstName + ', ' : ''}gracias por tu mensaje. ${CIERRE_FIJO}`;
+
+try {
+  const reglas = `
+Escribe un mensaje de WhatsApp en español como si fueras el autor de la canción.
+Objetivo: interpretar con empatía lo que la persona contó en su anécdota y agradecer con calidez.
+
+Requisitos MUY importantes:
+- Empieza saludando por el primer nombre: "${firstName}" si existe.
+- 1 sola frase natural (sin dos puntos ":"), que suene a comentario personal (me conmueve / qué bonita historia / me gusta…).
+- Usa SOLO datos provistos (no inventes nombres ni hechos).
+- Si hay artista o género, puedes mencionarlos brevemente SOLO si ayudan, sin exagerar.
+- Prohibido comillas, emojis y hashtags.
+- No pongas tiempos específicos.
+- NO incluyas la frase de cierre; yo la agregaré después.
+- Longitud preferida: 18–35 palabras.
+
+Ejemplo de estilo (solo referencia de tono, no copiar literalmente):
+"Sergio, me conmovió lo que cuentas de tu tocayo Sergio Pérez, perderle la pista de niños y verlo llegar a F1 con Red Bull; qué historia tan especial."
+`.trim();
+
+  const contexto = `
+Datos:
+- Nombre (para saludo): ${firstName || '(no disponible)'}
+- Anécdota: ${anecdotes || '(no disponible)'}
+- Género: ${genre || '(no especificado)'}
+- Artista: ${artist || '(no especificado)'}
+`.trim();
 
   const { text } = await chatCompletionCompat({
     model: 'gpt-4o-mini',
     messages: [
-      { role: 'system', content: 'Eres un extractor literal. No inventes.' },
-      { role: 'user', content: prompt }
+      { role: 'system', content: 'Eres conciso, cálido y natural. No inventas información.' },
+      { role: 'user', content: `${reglas}\n\n${contexto}\n\nRedacta SOLO la frase principal (sin el cierre).` }
     ],
-    max_tokens: 180,
-    temperature: 0.2
+    max_tokens: 120,
+    temperature: 0.35
   });
 
-  const m = String(text || '').match(/\{[\s\S]*\}/);
-  const json = m ? m[0] : text;
-  return JSON.parse(json);
-}
-
-// --- 2) Fallback heurístico (sin GPT) si algo falla ---
-function heuristic(texto) {
-  const t = ' ' + (texto || '') + ' ';
-  const personas = [];
-  if (/sergio\s+p[eé]rez/i.test(t) || /\bcheco\b/i.test(t)) personas.push('tu tocayo Sergio Pérez');
-  // puedes añadir más reglas si te interesan otras anécdotas típicas
-
-  const momentos = [];
-  if (/(niñ|catecismo)/i.test(t)) momentos.push('perderle la pista de niños');
-  if (/f1|f[óo]rmula\s*1/i.test(t)) momentos.push('verlo llegar a F1');
-  if (/red\s*bull/i.test(t)) momentos.push('con Red Bull');
-  if (!momentos.length) momentos.push('un momento importante');
-
-  let intencion = '';
-  if (/apoy/i.test(t) && /canci[óo]n/i.test(t)) intencion = 'querer apoyarlo con esta canción';
-
-  return { personas, momentos, intencion };
-}
-
-// --- 3) Construir el mensaje final personalizado ---
-let personas = [], momentos = [], intencion = '';
-
-if (rawAnecdote) {
-  try {
-    const data = await extractFacts(rawAnecdote);
-    personas  = Array.isArray(data?.personas) ? data.personas.filter(Boolean).slice(0,3).map(clean) : [];
-    momentos  = Array.isArray(data?.momentos) ? data.momentos.filter(Boolean).slice(0,3).map(clean) : [];
-    intencion = clean(data?.intencion || '');
-  } catch (e) {
-    console.warn('Extractor JSON falló, uso heurístico:', e?.message);
-    ({ personas, momentos, intencion } = heuristic(rawAnecdote));
+  const principal = text ? clean(text) : '';
+  if (principal) {
+    textoEmpatia = forceClose(principal);
+  } else {
+    // Fallback mini si GPT no devolvió nada
+    const base = firstName ? `${firstName}, ` : '';
+    const apunte = anecdotes
+      ? 'me conmueve lo que compartes; es una historia especial'
+      : 'gracias por la información';
+    textoEmpatia = `${base}${apunte}. ${CIERRE_FIJO}`;
   }
-} else {
-  ({ personas, momentos, intencion } = heuristic(''));
+
+  console.log('[GPT empatía] →', textoEmpatia);
+} catch (e) {
+  console.warn('GPT empatía falló, usando fallback:', e?.message);
+  const base = firstName ? `${firstName}, ` : '';
+  textoEmpatia = `${base}gracias por confiarme tu historia. ${CIERRE_FIJO}`;
 }
-
-const saludo = firstName ? `${firstName}, ` : '';
-const sujeto = personas.length ? `de ${personas[0]}` : 'de lo que compartes';
-const momentosFrase = joinHuman(momentos);
-const piezas = [];
-piezas.push(`${saludo}me conmovió lo que cuentas ${sujeto}`);
-if (momentosFrase) piezas.push(momentosFrase);
-if (intencion) piezas.push(intencion);
-
-// ejemplo: “Sergio, me conmovió lo que cuentas de tu tocayo Sergio Pérez: perderle la pista de niños,
-// verlo llegar a F1 con Red Bull y querer apoyarlo con esta canción.”
-let primeraFrase = piezas.filter(Boolean).join(': ');
-primeraFrase = cap(primeraFrase).replace(/\s+:/g, ':'); // limpia espacios antes de :
-
-// si prefieres SIN “:”, cambia por “, ”:
-if (true /* ← pon a false si quieres ":" */) {
-  // reemplaza el primer “: ” por “, ”
-  primeraFrase = primeraFrase.replace(': ', ', ');
-}
-
-let textoEmpatia = clean(`${primeraFrase}. ${cierreFijo}`);
-
-// toque opcional: si quieres mencionar el género sin romper el flujo
-// if (genre) textoEmpatia = textoEmpatia.replace('. ' , ` en el estilo ${genre}. `);
-
-console.log('[Empatía personalizado] →', textoEmpatia);
 
 // 3) Enviar mensaje de empatía
 await sendMessageToLead(phone, textoEmpatia);
+
 
 
 

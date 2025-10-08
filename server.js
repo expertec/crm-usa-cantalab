@@ -353,10 +353,10 @@ app.post('/api/sequences/enqueue', async (req, res) => {
 });
 
 /* --------------------- POST formulario → flujo completo ----------------- */
-// Corta "NuevoLead", genera/manda empatía (GPT) y encola "MusicaLead"
+// Corta "NuevoLead", genera empatía (GPT) con retraso y NO inicia MusicaLead aquí
 app.post('/api/lead/after-form', async (req, res) => {
   try {
-    const { leadId, summary } = req.body; // summary: { nombre, proposito, genero, artista, anecdotas, requesterName }
+    const { leadId, summary } = req.body; // summary: { nombre, proposito, genero, artista, anecdotas/anecdotes, requesterName }
     if (!leadId || !summary) {
       return res.status(400).json({ error: 'leadId y summary son requeridos' });
     }
@@ -372,32 +372,30 @@ app.post('/api/lead/after-form', async (req, res) => {
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
 
-
-
     // 2) Mensaje de empatía (HECHO por GPT: interpretación + tono humano, sin “:”, 1 frase + cierre)
-const requesterName = (summary?.requesterName || '').toString().trim(); // quien recibirá el WhatsApp
-const firstName     = requesterName.split(/\s+/)[0] || '';
-const anecdotes     = (summary?.anecdotes || summary?.anecdotas || '').toString().trim();
-const genre         = (summary?.genre || '').toString().trim();
-const artist        = (summary?.artist || '').toString().trim();
+    const requesterName = (summary?.requesterName || '').toString().trim(); // quien recibirá el WhatsApp
+    const firstName     = requesterName.split(/\s+/)[0] || '';
+    const anecdotes     = (summary?.anecdotes || summary?.anecdotas || '').toString().trim();
+    const genre         = (summary?.genre || '').toString().trim();
+    const artist        = (summary?.artist || '').toString().trim();
 
-const CIERRE_FIJO   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
+    const CIERRE_FIJO   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
 
-function clean(s) {
-  return String(s || '').replace(/[“”"']/g, '').replace(/\s+/g, ' ').trim();
-}
-function forceClose(text) {
-  // Asegura 1 frase principal + cierre fijo (sin “:”)
-  const t = clean(text).replace(/\s*:\s*/g, ', ');
-  // toma solo la primera oración/segmento razonable
-  const primera = t.split(/(?<=[.!?])\s+/)[0] || t;
-  return clean(`${primera} ${CIERRE_FIJO}`);
-}
+    function clean(s) {
+      return String(s || '').replace(/[“”"']/g, '').replace(/\s+/g, ' ').trim();
+    }
+    function forceClose(text) {
+      // Asegura 1 frase principal + cierre fijo (sin “:”)
+      const t = clean(text).replace(/\s*:\s*/g, ', ');
+      // toma solo la primera oración/segmento razonable
+      const primera = t.split(/(?<=[.!?])\s+/)[0] || t;
+      return clean(`${primera} ${CIERRE_FIJO}`);
+    }
 
-let textoEmpatia = `${firstName ? firstName + ', ' : ''}gracias por tu mensaje. ${CIERRE_FIJO}`;
+    let textoEmpatia = `${firstName ? firstName + ', ' : ''}gracias por tu mensaje. ${CIERRE_FIJO}`;
 
-try {
-  const reglas = `
+    try {
+      const reglas = `
 Escribe un mensaje de WhatsApp en español como si fueras el autor de la canción.
 Objetivo: interpretar con empatía lo que la persona contó en su anécdota y agradecer con calidez.
 
@@ -415,7 +413,7 @@ Ejemplo de estilo (solo referencia de tono, no copiar literalmente):
 "Sergio, me conmovió lo que cuentas de tu tocayo Sergio Pérez, perderle la pista de niños y verlo llegar a F1 con Red Bull; qué historia tan especial."
 `.trim();
 
-  const contexto = `
+      const contexto = `
 Datos:
 - Nombre (para saludo): ${firstName || '(no disponible)'}
 - Anécdota: ${anecdotes || '(no disponible)'}
@@ -423,45 +421,44 @@ Datos:
 - Artista: ${artist || '(no especificado)'}
 `.trim();
 
-  const { text } = await chatCompletionCompat({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: 'Eres conciso, cálido y natural. No inventas información.' },
-      { role: 'user', content: `${reglas}\n\n${contexto}\n\nRedacta SOLO la frase principal (sin el cierre).` }
-    ],
-    max_tokens: 120,
-    temperature: 0.35
-  });
+      const { text } = await chatCompletionCompat({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Eres conciso, cálido y natural. No inventas información.' },
+          { role: 'user', content: `${reglas}\n\n${contexto}\n\nRedacta SOLO la frase principal (sin el cierre).` }
+        ],
+        max_tokens: 120,
+        temperature: 0.35
+      });
 
-  const principal = text ? clean(text) : '';
-  if (principal) {
-    textoEmpatia = forceClose(principal);
-  } else {
-    // Fallback mini si GPT no devolvió nada
-    const base = firstName ? `${firstName}, ` : '';
-    const apunte = anecdotes
-      ? 'me conmueve lo que compartes; es una historia especial'
-      : 'gracias por la información';
-    textoEmpatia = `${base}${apunte}. ${CIERRE_FIJO}`;
-  }
+      const principal = text ? clean(text) : '';
+      if (principal) {
+        textoEmpatia = forceClose(principal);
+      } else {
+        // Fallback mini
+        const base = firstName ? `${firstName}, ` : '';
+        const apunte = anecdotes
+          ? 'me conmueve lo que compartes; es una historia especial'
+          : 'gracias por la información';
+        textoEmpatia = `${base}${apunte}. ${CIERRE_FIJO}`;
+      }
 
-  console.log('[GPT empatía] →', textoEmpatia);
-} catch (e) {
-  console.warn('GPT empatía falló, usando fallback:', e?.message);
-  const base = firstName ? `${firstName}, ` : '';
-  textoEmpatia = `${base}gracias por confiarme tu historia. ${CIERRE_FIJO}`;
-}
+      console.log('[GPT empatía] →', textoEmpatia);
+    } catch (e) {
+      console.warn('GPT empatía falló, usando fallback:', e?.message);
+      const base = firstName ? `${firstName}, ` : '';
+      textoEmpatia = `${base}gracias por confiarme tu historia. ${CIERRE_FIJO}`;
+    }
 
-// 3) Enviar mensaje de empatía
-await sendMessageToLead(phone, textoEmpatia);
+    // 3) Enviar mensaje de empatía con retraso (1–2 minutos)
+    const delayMs = 60_000 + Math.floor(Math.random() * 60_000); // 60–120s
+    setTimeout(() => {
+      sendMessageToLead(phone, textoEmpatia).catch(err =>
+        console.error('Error enviando empatía diferida:', err)
+      );
+    }, delayMs);
 
-
-
-
-
-
-    // 4) Encolar MusicaLead (editable desde tu panel)
-    await scheduleSequenceForLead(leadId, 'MusicaLead', new Date());
+    // ❌ YA NO iniciar MusicaLead aquí; se hará tras enviar el link en scheduler.js
 
     return res.json({ ok: true });
   } catch (e) {
@@ -481,6 +478,158 @@ app.post('/api/whatsapp/mark-read', async (req, res) => {
   } catch (err) {
     console.error('Error marcando como leídos:', err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ===================== Reproductor con token (HTML simple) ===================== */
+app.get('/escuchar/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    // localizar doc musica por token
+    const snap = await db.collection('musica').where('listen.token', '==', token).limit(1).get();
+    if (snap.empty) return res.status(404).send('Link inválido o expirado');
+
+    const d = snap.docs[0].data();
+    if (d.listen?.disabled) return res.status(410).send('Este enlace ya no está disponible.');
+
+    // Página mínima con reproductor (usa stream protegido y progreso)
+    const html = `
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Escuchar tu canción</title>
+<style>
+  body { font-family: system-ui, Arial; padding: 20px; max-width: 520px; margin: auto; }
+  .wrap { border: 1px solid #ddd; border-radius: 14px; padding: 16px; }
+  .warn { color: #9a3412; font-size: 14px; margin-top: 8px; }
+  audio { width: 100%; margin-top: 10px; }
+  .muted { color: #666; font-size: 13px; }
+</style>
+<div class="wrap">
+  <h2>🎧 Tu canción</h2>
+  <p class="muted">Este enlace permite hasta 2 reproducciones.</p>
+  <audio id="player" controls controlsList="nodownload noplaybackrate">
+    <source src="/api/music/stream/${token}" type="audio/mp4"/>
+    Tu navegador no soporta audio.
+  </audio>
+  <p class="warn">No cierres esta ventana mientras escuchas.</p>
+</div>
+<script>
+  (function(){
+    const audio = document.getElementById('player');
+    let sent50 = false;
+    let duration = 0;
+
+    audio.addEventListener('loadedmetadata', () => {
+      duration = audio.duration || 0;
+    });
+
+    // Reporta 50% una sola vez
+    setInterval(() => {
+      if (sent50) return;
+      if (!duration || !isFinite(duration)) return;
+      const cur = audio.currentTime || 0;
+      const pct = cur / duration;
+      if (pct >= 0.5) {
+        sent50 = true;
+        fetch('/api/music/progress', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: '${token}', pct: 0.5 })
+        }).catch(() => {});
+      }
+    }, 2000);
+  })();
+</script>
+`;
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(html);
+  } catch (e) {
+    console.error('GET /escuchar error:', e);
+    return res.status(500).send('Error de servidor');
+  }
+});
+
+/* ===================== Stream protegido con contador de plays ===================== */
+app.get('/api/music/stream/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    // localizar doc musica
+    const qs = await db.collection('musica').where('listen.token', '==', token).limit(1).get();
+    if (qs.empty) return res.status(404).send('No encontrado');
+
+    const doc = qs.docs[0];
+    const data = doc.data();
+
+    if (data.listen?.disabled) return res.status(410).send('Enlace deshabilitado');
+    const playCount = Number(data.listen?.playCount || 0);
+    const maxPlays  = Number(data.listen?.maxPlays || 2);
+    if (playCount >= maxPlays) {
+      return res.status(403).send('Has alcanzado el límite de reproducciones');
+    }
+
+    // Incrementar playCount de forma atómica (una vez por “play”)
+    await doc.ref.update({ 'listen.playCount': admin.firestore.FieldValue.increment(1) });
+
+    // Si quieres deshabilitar al llegar justo al máximo, descomenta:
+    // if (playCount + 1 >= maxPlays) {
+    //   await doc.ref.update({ 'listen.disabled': true });
+    // }
+
+    // Proxy del archivo (usa clipUrl si es el que quieres limitar)
+    const fileUrl = data.clipUrl || data.fullUrl;
+    if (!fileUrl) return res.status(404).send('Archivo no disponible');
+
+    // Descargar por streaming y reenviar (sin descarga)
+    const upstream = await axios.get(fileUrl, { responseType: 'stream' });
+
+    res.setHeader('Content-Type', upstream.headers['content-type'] || 'audio/mp4');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Content-Disposition', 'inline; filename="escucha.m4a"');
+    // Nota: impedir descarga al 100% es imposible en la web; esto la dificulta.
+
+    upstream.data.pipe(res);
+    upstream.data.on('error', err => {
+      console.error('Stream proxy error:', err);
+      try { res.destroy(err); } catch {}
+    });
+  } catch (e) {
+    console.error('GET /api/music/stream error:', e);
+    return res.status(500).send('Error de servidor');
+  }
+});
+
+/* ===================== Progreso: 50% → parar MusicaLead, iniciar LeadSeguimiento ===================== */
+app.post('/api/music/progress', async (req, res) => {
+  try {
+    const { token, pct } = req.body || {};
+    if (!token) return res.status(400).json({ ok: false });
+
+    const qs = await db.collection('musica').where('listen.token', '==', token).limit(1).get();
+    if (qs.empty) return res.status(404).json({ ok: false });
+
+    const doc = qs.docs[0];
+    const data = doc.data();
+
+    // marca “>=50% escuchado”
+    await doc.ref.set({ 'listen.halfHeard': true }, { merge: true });
+
+    if (data.leadId) {
+      // 1) Desactivar MusicaLead
+      await cancelSequences(data.leadId, ['MusicaLead']);
+      // 2) Activar LeadSeguimiento
+      await scheduleSequenceForLead(data.leadId, 'LeadSeguimiento', new Date());
+      console.log(`🔁 Secuencias: MusicaLead cancelada → LeadSeguimiento iniciada para ${data.leadId}`);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/music/progress error:', e);
+    return res.status(500).json({ ok: false });
   }
 });
 

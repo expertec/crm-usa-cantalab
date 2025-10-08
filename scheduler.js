@@ -9,7 +9,8 @@ import path from 'path';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 
-import { processQueue, cancelSequences } from './queue.js';
+import { processQueue, cancelSequences, scheduleSequenceForLead } from './queue.js';
+
 import { sendMessageToLead, sendClipMessage } from './whatsappService.js';
 
 const bucket = admin.storage().bucket();
@@ -318,8 +319,8 @@ async function procesarClips() {
   }
 }
 
-// 5) Enviar letra + clip a WhatsApp y marcar Enviada
-// 5) Enviar letra + link de escucha a WhatsApp y marcar Enviada
+// 5) Enviar letra + link de escucha a WhatsApp, marcar Enviada,
+//    iniciar MusicaLead (a partir del envío del link) y preparar control de reproducción
 async function enviarMusicaPorWhatsApp() {
   const snap = await db.collection('musica').where('status', '==', 'Enviar música').get();
   if (snap.empty) return;
@@ -342,7 +343,7 @@ async function enviarMusicaPorWhatsApp() {
         : `Esta es la letra:\n\n${lyrics}`;
       await sendMessageToLead(leadPhone, saludo);
 
-      // 2) Generar link de escucha
+      // 2) Generar link de escucha (tu frontend /escuchar/:leadPhone debe respetar maxPlays y evitar descarga)
       const listenUrl = `https://cantalab.com/escuchar/${leadPhone}`;
 
       // 3) Enviar mensaje con link
@@ -351,14 +352,19 @@ async function enviarMusicaPorWhatsApp() {
         `🎧 Ya tenemos tu canción lista.\n\nEscúchala aquí:\n${listenUrl}\n\n⚠️ El acceso es limitado, guárdalo bien.`
       );
 
-      // 4) Marcar como enviada en Firestore
+      // 4) Marcar como enviada en Firestore + preparar control de reproducción
       await ref.update({
         status: 'Enviada',
         listenUrl,
-        sentAt: FieldValue.serverTimestamp()
+        sentAt: FieldValue.serverTimestamp(),
+        // Campos para control de plays (el frontend deberá actualizarlos)
+        playCount: 0,           // contador de reproducciones
+        maxPlays: 2,            // límite
+        lastPlayAt: null,       // se llena al escuchar
+        allowPlay: true         // tu player debe revisar esto antes de permitir play
       });
 
-      // (opcional) Etiqueta informativa
+      // (opcional) Etiqueta informativa en el lead
       if (leadId) {
         await db.collection('leads').doc(leadId).set(
           { etiquetas: admin.firestore.FieldValue.arrayUnion('CancionEnviada') },
@@ -366,13 +372,19 @@ async function enviarMusicaPorWhatsApp() {
         );
       }
 
-      console.log(`✅ Música enviada a ${leadPhone} (doc ${doc.id})`);
+      // 5) INICIAR MusicaLead AQUÍ (solo después de haber enviado el link)
+      if (leadId) {
+        await scheduleSequenceForLead(leadId, 'MusicaLead', new Date());
+      }
+
+      console.log(`✅ Música enviada a ${leadPhone} (doc ${doc.id}) y MusicaLead programada`);
     } catch (err) {
       console.error(`❌ Error en ${doc.id}:`, err);
       await ref.update({ status: 'Error música', errorMsg: err.message });
     }
   }
 }
+
 
 
 // 6) Reintento de stuck (Suno)

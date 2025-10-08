@@ -371,47 +371,124 @@ app.post('/api/lead/after-form', async (req, res) => {
     // 1) Cancelar recordatorios de captación
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
-
-   // 2) Mensaje de empatía (determinístico, sin GPT, sin “:”, suena a voz propia)
+// 2) Mensaje de empatía (personalizado por lead; extractivo; sin inventar)
 const nombre       = (summary?.nombre || lead?.nombre || '').toString().trim();
 const firstName    = (nombre || '').split(/\s+/)[0] || '';
-const anecdotesRaw = (summary?.anecdotes || summary?.anecdotas || '').toString().trim(); // usa el campo real
+const rawAnecdote  = (summary?.anecdotes || summary?.anecdotas || '').toString().trim();
+const genre        = (summary?.genre || '').toString().trim();   // opcional
+const artist       = (summary?.artist || '').toString().trim();  // opcional
 const cierreFijo   = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
 
-// Helpers
 function clean(s) {
-  return String(s || '')
-    .replace(/[“”"']/g, '')   // sin comillas
-    .replace(/\s+/g, ' ')
-    .trim();
+  return String(s || '').replace(/[“”"']/g, '').replace(/\s+/g, ' ').trim();
 }
-function shortenByWords(s, maxWords = 45) {
-  const words = clean(s).split(/\s+/);
-  if (words.length <= maxWords) return clean(s);
-  return clean(words.slice(0, maxWords).join(' ') + '…');
+function cap(s) {
+  const t = clean(s); return t ? t[0].toUpperCase() + t.slice(1) : '';
 }
-function sentenceCase(s) {
-  const t = clean(s);
-  if (!t) return '';
-  return t.charAt(0).toUpperCase() + t.slice(1);
+function joinHuman(arr) {
+  if (!arr?.length) return '';
+  if (arr.length === 1) return arr[0];
+  if (arr.length === 2) return `${arr[0]} y ${arr[1]}`;
+  return `${arr.slice(0,-1).join(', ')} y ${arr.at(-1)}`;
 }
 
-// Construcción sin dos puntos y en tono personal
-let textoEmpatia;
-if (anecdotesRaw) {
-  const frag = sentenceCase(shortenByWords(anecdotesRaw, 45)); // recorta si es muy largo
-  const saludo = firstName ? `${firstName}, ` : '';
-  // Ejemplos resultantes:
-  // "Sergio, me conmovió lo que cuentas de ... Voy a poner todo de mí ..."
-  // "Sergio, qué especial lo que compartes sobre ... Voy a poner todo de mí ..."
-  textoEmpatia = clean(`${saludo}me conmovió lo que compartes sobre ${frag}. ${cierreFijo}`);
-} else {
-  const saludo = firstName ? `${firstName}, ` : '';
-  textoEmpatia = clean(`${saludo}gracias por la información, ya estoy trabajando en tu canción. ${cierreFijo}`);
+// --- 1) Intento: extracción estructurada con GPT en modo “no inventes” ---
+async function extractFacts(texto) {
+  const prompt = `
+Devuelve SOLO JSON con este esquema exacto y en español:
+{
+  "personas": ["..."],        // 0-3 nombres/frases tal como aparecen (ej: "tu tocayo Sergio Pérez")
+  "momentos": ["..."],        // 1-3 momentos de la historia, cada uno ≤ 7 palabras, sin inventar
+  "intencion": "..."          // 3-10 palabras, p.ej. "querer apoyarlo con esta canción"
 }
+REGLAS:
+- Cita exactamente lo escrito (no inventes detalles).
+- Momentos: máximo 3, ≤7 palabras cada uno.
+- Si no ves intención explícita, deja "intencion": "".
+Anécdota:
+${texto}
+  `.trim();
+
+  const { text } = await chatCompletionCompat({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'Eres un extractor literal. No inventes.' },
+      { role: 'user', content: prompt }
+    ],
+    max_tokens: 180,
+    temperature: 0.2
+  });
+
+  const m = String(text || '').match(/\{[\s\S]*\}/);
+  const json = m ? m[0] : text;
+  return JSON.parse(json);
+}
+
+// --- 2) Fallback heurístico (sin GPT) si algo falla ---
+function heuristic(texto) {
+  const t = ' ' + (texto || '') + ' ';
+  const personas = [];
+  if (/sergio\s+p[eé]rez/i.test(t) || /\bcheco\b/i.test(t)) personas.push('tu tocayo Sergio Pérez');
+  // puedes añadir más reglas si te interesan otras anécdotas típicas
+
+  const momentos = [];
+  if (/(niñ|catecismo)/i.test(t)) momentos.push('perderle la pista de niños');
+  if (/f1|f[óo]rmula\s*1/i.test(t)) momentos.push('verlo llegar a F1');
+  if (/red\s*bull/i.test(t)) momentos.push('con Red Bull');
+  if (!momentos.length) momentos.push('un momento importante');
+
+  let intencion = '';
+  if (/apoy/i.test(t) && /canci[óo]n/i.test(t)) intencion = 'querer apoyarlo con esta canción';
+
+  return { personas, momentos, intencion };
+}
+
+// --- 3) Construir el mensaje final personalizado ---
+let personas = [], momentos = [], intencion = '';
+
+if (rawAnecdote) {
+  try {
+    const data = await extractFacts(rawAnecdote);
+    personas  = Array.isArray(data?.personas) ? data.personas.filter(Boolean).slice(0,3).map(clean) : [];
+    momentos  = Array.isArray(data?.momentos) ? data.momentos.filter(Boolean).slice(0,3).map(clean) : [];
+    intencion = clean(data?.intencion || '');
+  } catch (e) {
+    console.warn('Extractor JSON falló, uso heurístico:', e?.message);
+    ({ personas, momentos, intencion } = heuristic(rawAnecdote));
+  }
+} else {
+  ({ personas, momentos, intencion } = heuristic(''));
+}
+
+const saludo = firstName ? `${firstName}, ` : '';
+const sujeto = personas.length ? `de ${personas[0]}` : 'de lo que compartes';
+const momentosFrase = joinHuman(momentos);
+const piezas = [];
+piezas.push(`${saludo}me conmovió lo que cuentas ${sujeto}`);
+if (momentosFrase) piezas.push(momentosFrase);
+if (intencion) piezas.push(intencion);
+
+// ejemplo: “Sergio, me conmovió lo que cuentas de tu tocayo Sergio Pérez: perderle la pista de niños,
+// verlo llegar a F1 con Red Bull y querer apoyarlo con esta canción.”
+let primeraFrase = piezas.filter(Boolean).join(': ');
+primeraFrase = cap(primeraFrase).replace(/\s+:/g, ':'); // limpia espacios antes de :
+
+// si prefieres SIN “:”, cambia por “, ”:
+if (true /* ← pon a false si quieres ":" */) {
+  // reemplaza el primer “: ” por “, ”
+  primeraFrase = primeraFrase.replace(': ', ', ');
+}
+
+let textoEmpatia = clean(`${primeraFrase}. ${cierreFijo}`);
+
+// toque opcional: si quieres mencionar el género sin romper el flujo
+// if (genre) textoEmpatia = textoEmpatia.replace('. ' , ` en el estilo ${genre}. `);
+
+console.log('[Empatía personalizado] →', textoEmpatia);
 
 // 3) Enviar mensaje de empatía
 await sendMessageToLead(phone, textoEmpatia);
+
 
 
 

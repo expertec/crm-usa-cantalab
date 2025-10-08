@@ -44,44 +44,15 @@ import {
   retryStuckMusic
 } from './scheduler.js';
 
-// 🔹 OpenAI (lazy + compat v3/v4)
+// 🔹 OpenAI para el mensaje de empatía
 import OpenAIImport from 'openai';
 
 dotenv.config();
 
-// ---- OpenAI helpers (no instancia global) ----
-function assertOpenAIKey() {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('Falta la variable de entorno OPENAI_API_KEY');
-  }
-}
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-// En v4 el paquete puede exportar { OpenAI } o el ctor por default
-const OpenAICtor = OpenAIImport?.OpenAI || OpenAIImport;
-
-/** Crea el cliente OpenAI solo cuando se usa.
- *  Devuelve { client, mode: 'v4'|'v3' }
- */
-async function getOpenAI() {
-  assertOpenAIKey();
-
-  try {
-    const client = new OpenAICtor({ apiKey: process.env.OPENAI_API_KEY });
-    if (client?.chat?.completions?.create) {
-      return { client, mode: 'v4' };
-    }
-  } catch {
-    // fall back a v3
-  }
-
-  // Fallback v3 (openai@3)
-  const { Configuration, OpenAIApi } = await import('openai');
-  const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
-  const client = new OpenAIApi(configuration);
-  return { client, mode: 'v3' };
-}
-
-// ---------------------------------------------
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -335,35 +306,20 @@ mandaremos enseguida. Evita promesas de tiempo exacto. No uses comillas.
     `.trim();
 
     let textoEmpatia = '¡Gracias por la info! Estamos creando tu canción y en breve te la enviamos.';
-    try {
-      const { client, mode } = await getOpenAI();
-
-      if (mode === 'v4') {
-        const gpt = await client.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: 'Eres conciso, cálido y natural.' },
-            { role: 'user', content: prompt }
-          ],
-          max_tokens: 120,
-          temperature: 0.7
-        });
-        textoEmpatia = (gpt.choices?.[0]?.message?.content || textoEmpatia).trim();
-      } else {
-        const gpt = await client.createChatCompletion({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: 'Eres conciso, cálido y natural.' },
-            { role: 'user', content: prompt }
-          ],
-          max_tokens: 120,
-          temperature: 0.7
-        });
-        textoEmpatia = (gpt.data?.choices?.[0]?.message?.content || textoEmpatia).trim();
-      }
-    } catch (e) {
-      console.warn('GPT empatía falló, usando fallback:', e?.message);
-    }
+try {
+  const gpt = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'Eres conciso, cálido y natural.' },
+      { role: 'user', content: prompt }
+    ],
+    max_tokens: 120,
+    temperature: 0.7
+  });
+  textoEmpatia = (gpt.choices?.[0]?.message?.content || textoEmpatia).trim();
+} catch (e) {
+  console.warn('GPT empatía falló, usando fallback:', e?.message);
+}
 
     // 3) Enviar mensaje de empatía
     await sendMessageToLead(phone, textoEmpatia);

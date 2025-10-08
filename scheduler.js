@@ -1,7 +1,8 @@
 // src/server/scheduler.js
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
-import OpenAIImport from 'openai'; // import flexible (v3/v4)
+import OpenAI from 'openai';
+
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -14,47 +15,35 @@ import { sendMessageToLead } from './whatsappService.js';
 const bucket = admin.storage().bucket();
 const { FieldValue } = admin.firestore;
 
-/* ========================= OpenAI (v3/v4 compatible, lazy) ========================= */
-function assertApiKey() {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('Falta la variable de entorno OPENAI_API_KEY');
-  }
+/* ========================= OpenAI (v3/v4 compatible) ========================= */
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error('Falta la variable de entorno OPENAI_API_KEY');
 }
 
-const OpenAICtor = OpenAIImport?.OpenAI || OpenAIImport;
+let openai;          // cliente
+let isV4 = true;     // flag para saber cómo leer la respuesta
 
-/** Crea el cliente OpenAI sólo cuando se necesita.
- *  Devuelve { client, mode: 'v4'|'v3' }
- */
-async function getOpenAI() {
-  assertApiKey();
+try {
+  // Intento v4
+  openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  if (!openai?.chat?.completions?.create) isV4 = false;
+} catch {
+  isV4 = false;
+}
 
-  // Intento v4 (openai@4: new OpenAI({ apiKey }))
-  try {
-    const client = new OpenAICtor({ apiKey: process.env.OPENAI_API_KEY });
-    if (client?.chat?.completions?.create) {
-      return { client, mode: 'v4' };
-    }
-  } catch {
-    // caemos a v3
-  }
-
-  // Fallback v3 (openai@3: new OpenAIApi(new Configuration(...)))
+if (!isV4) {
+  // Carga v3 (createChatCompletion)
   const { Configuration, OpenAIApi } = await import('openai');
   const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
-  const client = new OpenAIApi(configuration);
-  return { client, mode: 'v3' };
+  openai = new OpenAIApi(configuration);
 }
 
-/** Wrapper unificado para chat completions */
+// Helper único para pedir completions sin preocuparnos por la versión
 async function chatCompletion({ model, messages, max_tokens, temperature }) {
-  const { client, mode } = await getOpenAI();
-
-  if (mode === 'v4') {
-    return await client.chat.completions.create({ model, messages, max_tokens, temperature });
+  if (isV4) {
+    return await openai.chat.completions.create({ model, messages, max_tokens, temperature });
   } else {
-    // v3
-    return await client.createChatCompletion({ model, messages, max_tokens, temperature });
+    return await openai.createChatCompletion({ model, messages, max_tokens, temperature });
   }
 }
 
@@ -175,7 +164,9 @@ Anecdotas: ${d.anecdotes}.
     temperature: 0.7
   });
 
-  const letra = (resp?.choices?.[0]?.message?.content ?? resp?.data?.choices?.[0]?.message?.content)?.trim();
+  const letra = (isV4
+    ? resp.choices?.[0]?.message?.content
+    : resp.data?.choices?.[0]?.message?.content)?.trim();
 
   if (!letra) throw new Error(`No letra para ${docSnap.id}`);
 
@@ -223,7 +214,9 @@ Ejemplo: "rock pop con influencias blues, guitarra eléctrica, batería enérgic
     temperature: 0.7
   });
 
-  const stylePrompt = (gptRes?.choices?.[0]?.message?.content ?? gptRes?.data?.choices?.[0]?.message?.content)?.trim();
+  const stylePrompt = (isV4
+    ? gptRes.choices?.[0]?.message?.content
+    : gptRes.data?.choices?.[0]?.message?.content)?.trim();
 
   await docSnap.ref.update({ stylePrompt, status: 'Sin música' });
   console.log(`✅ generarPromptParaMusica: ${docSnap.id} → "${stylePrompt}"`);

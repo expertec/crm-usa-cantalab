@@ -37,6 +37,9 @@ function tpl(str, lead) {
     return lead?.[f] ?? '';
   });
 }
+function now() {
+  return new Date();
+}
 
 /* ---------------------------- conexión WA ---------------------------- */
 export async function connectToWhatsApp() {
@@ -96,16 +99,47 @@ export async function connectToWhatsApp() {
           const jid = msg.key.remoteJid;
           if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
-          const phone = jid.split('@')[0];
+          const phone = jid.split('@')[0]; // E164 sin '+', ej: 521831...
           const leadId = jid;
           const sender = msg.key.fromMe ? 'business' : 'lead';
 
-          // contenido / media
+          // ------- crear/actualizar LEAD (ANTES de parsear tipo) -------
+          const leadRef = db.collection('leads').doc(leadId);
+          const leadSnap = await leadRef.get();
+
+          // config global para defaultTrigger
+          const cfgSnap = await db.collection('config').doc('appConfig').get();
+          const cfg = cfgSnap.exists ? cfgSnap.data() : {};
+          let trigger = cfg.defaultTrigger || 'NuevoLead';
+
+          const baseLead = {
+            telefono: phone,                // almacenamos E164 sin '+'
+            nombre: msg.pushName || '',
+            source: 'WhatsApp',
+          };
+
+          if (!leadSnap.exists) {
+            await leadRef.set({
+              ...baseLead,
+              fecha_creacion: now(),
+              estado: 'nuevo',
+              etiquetas: [trigger],
+              unreadCount: 0,
+              lastMessageAt: now(),
+            });
+
+            // programa secuencia inicial
+            await scheduleSequenceForLead(leadId, trigger);
+          } else {
+            // solo lastMessageAt; etiquetas se ajustan después si hay hashtag
+            await leadRef.update({ lastMessageAt: now() });
+          }
+
+          // ------- parseo de tipos (NUNCA hacer continue) -------
           let content = '';
           let mediaType = null;
           let mediaUrl = null;
 
-          // --- parseo de tipos ---
           if (msg.message?.videoMessage) {
             mediaType = 'video';
             const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: Pino() });
@@ -143,60 +177,30 @@ export async function connectToWhatsApp() {
             mediaType = 'text';
             content = msg.message.extendedTextMessage.text.trim();
           } else {
-            continue; // otros tipos los ignoramos por ahora
+            mediaType = 'unknown';
+            content = ''; // puedes guardar JSON.stringify(msg.message) si quieres auditoría
           }
 
-          // ------- buscar/crear LEAD (docId = jid) -------
-          const leadRef = db.collection('leads').doc(leadId);
-          const leadSnap = await leadRef.get();
-
-          // config global para defaultTrigger
-          const cfgSnap = await db.collection('config').doc('appConfig').get();
-          const cfg = cfgSnap.exists ? cfgSnap.data() : {};
-          let trigger =
-            content.includes('#webPro1490')
-              ? 'LeadWeb1490'
-              : (cfg.defaultTrigger || 'NuevoLead');
-
-          const baseLead = {
-            telefono: phone,                // almacenamos E164 sin '+'
-            nombre: msg.pushName || '',
-            source: 'WhatsApp',
-          };
-
-          if (!leadSnap.exists) {
-            // crear lead (sin guardar secuencias en el doc; usamos la cola)
-            await leadRef.set({
-              ...baseLead,
-              fecha_creacion: new Date(),
-              estado: 'nuevo',
-              etiquetas: [trigger],
-              unreadCount: 0,
-              lastMessageAt: new Date(),
-            });
-
-            // programa secuencia inicial
-            await scheduleSequenceForLead(leadId, trigger);
-
-            // si el trigger inicial fuera MusicaLead, cancela recordatorios
-            if (trigger === 'MusicaLead') {
-              const cancelled = await cancelSequences(leadId, ['NuevoLead']);
-              if (cancelled) {
-                await leadRef.set({ nuevoLeadCancelled: true }, { merge: true });
-              }
+          // ------- si hay hashtag en texto, ajusta trigger/etiquetas -------
+          if (mediaType === 'text' && content) {
+            // ejemplo de mapeo de hashtags → triggers
+            if (/#webPro1490/i.test(content)) {
+              trigger = 'LeadWeb1490';
+            } else if (/#musicale(a)?d/i.test(content) || /#MusicaLead/.test(content)) {
+              trigger = 'MusicaLead';
+            } else if (/#nuevolead/i.test(content)) {
+              trigger = 'NuevoLead';
             }
-          } else {
-            const cur = leadSnap.data() || {};
-            const hadTag =
-              Array.isArray(cur.etiquetas) && cur.etiquetas.includes(trigger);
 
-            // etiqueta + meta
-            await leadRef.update({
-              etiquetas: FieldValue.arrayUnion(trigger),
-              lastMessageAt: new Date(),
-            });
+            // añade etiqueta y agenda si es nueva
+            const cur = (await leadRef.get()).data() || {};
+            const hadTag = Array.isArray(cur.etiquetas) && cur.etiquetas.includes(trigger);
 
-            // si no tenía esa etiqueta, programa secuencia
+            await leadRef.set(
+              { etiquetas: FieldValue.arrayUnion(trigger) },
+              { merge: true }
+            );
+
             if (!hadTag) {
               await scheduleSequenceForLead(leadId, trigger);
             }
@@ -210,20 +214,20 @@ export async function connectToWhatsApp() {
             }
           }
 
-          // guardar mensaje en subcolección
+          // ------- guardar mensaje en subcolección -------
           const msgData = {
             content,
             mediaType,
             mediaUrl,
             sender,
-            timestamp: new Date(),
+            timestamp: now(),
           };
-          await db.collection('leads').doc(leadId).collection('messages').add(msgData);
+          await leadRef.collection('messages').add(msgData);
 
           // actualizar counters
           const upd = { lastMessageAt: msgData.timestamp };
           if (sender === 'lead') upd.unreadCount = FieldValue.increment(1);
-          await db.collection('leads').doc(leadId).update(upd);
+          await leadRef.update(upd);
         } catch (err) {
           console.error('messages.upsert error:', err);
         }
@@ -254,7 +258,7 @@ export function getSessionPhone() {
 export async function sendMessageToLead(phone, messageContent) {
   if (!whatsappSock) throw new Error('No hay conexión activa con WhatsApp');
   let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
+  if (num.length === 10) num = '52' + num; // normaliza MX
   const jid = `${num}@s.whatsapp.net`;
 
   await whatsappSock.sendMessage(
@@ -267,7 +271,7 @@ export async function sendMessageToLead(phone, messageContent) {
   const q = await db.collection('leads').where('telefono', '==', num).limit(1).get();
   if (!q.empty) {
     const leadId = q.docs[0].id;
-    const outMsg = { content: messageContent, sender: 'business', timestamp: new Date() };
+    const outMsg = { content: messageContent, sender: 'business', timestamp: now() };
     await db.collection('leads').doc(leadId).collection('messages').add(outMsg);
     await db.collection('leads').doc(leadId).update({ lastMessageAt: outMsg.timestamp });
   }
@@ -298,7 +302,8 @@ export async function sendAudioMessage(phone, filePath) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('Socket de WhatsApp no está conectado');
 
-  const num = String(phone).replace(/\D/g, '');
+  let num = String(phone).replace(/\D/g, '');
+  if (num.length === 10) num = '52' + num;
   const jid = `${num}@s.whatsapp.net`;
 
   const audioBuffer = fs.readFileSync(filePath);
@@ -313,7 +318,7 @@ export async function sendAudioMessage(phone, filePath) {
   const q = await db.collection('leads').where('telefono', '==', num).limit(1).get();
   if (!q.empty) {
     const leadId = q.docs[0].id;
-    const msgData = { content: '', mediaType: 'audio', mediaUrl, sender: 'business', timestamp: new Date() };
+    const msgData = { content: '', mediaType: 'audio', mediaUrl, sender: 'business', timestamp: now() };
     await db.collection('leads').doc(leadId).collection('messages').add(msgData);
     await db.collection('leads').doc(leadId).update({ lastMessageAt: msgData.timestamp });
   }

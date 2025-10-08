@@ -4,12 +4,13 @@ import {
   sendMessageToLead,
   sendClipMessage,
   getWhatsAppSock,
-  sendVideoNote   
+  sendVideoNote
 } from './whatsappService.js';
 
 const { FieldValue } = admin.firestore;
 
 /* ----------------------------- utilidades ------------------------------ */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function firstName(full = '') {
   return String(full).trim().split(/\s+/)[0] || '';
@@ -30,10 +31,24 @@ function replacePlaceholders(template, lead) {
 
 /**
  * Programa todos los mensajes de la secuencia "trigger" para un lead.
- * Prioriza doc id = trigger. Si no existe, hace fallback a where('trigger'==trigger).
- * Espera un doc con shape: { active: true, messages: [{ type, contenido, delay }, ...] }
+ * - Limpia previamente jobs pendientes del mismo trigger (idempotencia).
+ * - Conserva el orden del front mediante el índice `idx`.
+ * - Añade un jitter de idx*250ms a dueAt para romper empates del mismo minuto.
  */
 export async function scheduleSequenceForLead(leadId, trigger, startAt = new Date()) {
+  // 0) limpiar pendientes del mismo trigger para este lead
+  const oldSnap = await db.collection('sequenceQueue')
+    .where('leadId', '==', leadId)
+    .where('trigger', '==', trigger)
+    .where('status', '==', 'pending')
+    .get();
+
+  if (!oldSnap.empty) {
+    const bdel = db.batch();
+    oldSnap.forEach(d => bdel.delete(d.ref));
+    await bdel.commit();
+  }
+
   // 1) intenta doc por id
   let seqDoc = await db.collection('secuencias').doc(trigger).get();
 
@@ -62,12 +77,13 @@ export async function scheduleSequenceForLead(leadId, trigger, startAt = new Dat
 
   messages.forEach((m, idx) => {
     const delayMin = Number(m.delay || 0);
-    const dueAt = new Date(startMs + delayMin * 60_000);
+    // Jitter de 250ms por posición para mantener orden dentro del mismo minuto
+    const dueAt = new Date(startMs + delayMin * 60_000 + idx * 250);
     const ref = db.collection('sequenceQueue').doc();
     batch.set(ref, {
       leadId,
       trigger,
-      idx,
+      idx, // ← orden dado por el front
       payload: {
         type: m.type || 'texto',
         contenido: m.contenido || ''
@@ -80,7 +96,8 @@ export async function scheduleSequenceForLead(leadId, trigger, startAt = new Dat
   });
 
   await batch.commit();
-  // hint en el lead (opcional)
+
+  // pista en el lead (opcional)
   await db.collection('leads').doc(leadId).set({
     hasActiveSequences: true
   }, { merge: true });
@@ -124,7 +141,7 @@ async function deliverPayload(leadId, payload) {
   const phone = String(lead.telefono || '').replace(/\D/g, '');
   if (!phone) throw new Error(`Lead sin telefono: ${leadId}`);
 
-  const type = payload?.type || 'texto';
+  const type = (payload?.type || 'texto').toLowerCase();
   const contenido = payload?.contenido || '';
 
   // acceso al socket por si mandamos multimedia
@@ -138,7 +155,6 @@ async function deliverPayload(leadId, payload) {
     }
 
     case 'formulario': {
-      // Ejemplo plantilla: "Completa aquí: https://cantalab.com/{{telefono}}?nombre={{nombre}}"
       const text = replacePlaceholders(contenido, lead).trim();
       if (text) await sendMessageToLead(phone, text);
       break;
@@ -146,7 +162,6 @@ async function deliverPayload(leadId, payload) {
 
     case 'audio':
     case 'clip': {
-      // pensado para .m4a/.mp4 (AAC) – usamos helper que envía inline por URL
       const url = replacePlaceholders(contenido, lead).trim();
       if (url) await sendClipMessage(phone, url);
       break;
@@ -158,7 +173,6 @@ async function deliverPayload(leadId, payload) {
         const jid = `${phone}@s.whatsapp.net`;
         await sock.sendMessage(jid, { image: { url } });
       } else if (url) {
-        // fallback: manda el link como texto
         await sendMessageToLead(phone, url);
       }
       break;
@@ -175,9 +189,9 @@ async function deliverPayload(leadId, payload) {
       break;
     }
 
-      // NUEVO: video note (video redondo)
     case 'videonota':
-    case 'video_note': {
+    case 'video_note':
+    case 'video-note': {
       const url = replacePlaceholders(contenido, lead).trim();
       if (url) await sendVideoNote(phone, url);
       break;
@@ -194,7 +208,8 @@ async function deliverPayload(leadId, payload) {
 
 /**
  * Procesa jobs pendientes cuya dueAt <= ahora.
- * Usa índice: status ASC, dueAt ASC
+ * Orden total: dueAt ASC, idx ASC, createdAt ASC.
+ * ENVÍO SECUENCIAL (no paralelo) para preservar orden exacto.
  */
 export async function processQueue({ batchSize = 100, shard = null } = {}) {
   const now = new Date();
@@ -210,28 +225,44 @@ export async function processQueue({ batchSize = 100, shard = null } = {}) {
   const snap = await q.get();
   if (snap.empty) return 0;
 
-  await Promise.all(snap.docs.map(async (d) => {
-    const job = { id: d.id, ...d.data() };
+  // Orden determinista adicional por idx y createdAt
+  const jobs = snap.docs
+    .map(d => ({ id: d.id, ref: d.ref, ...d.data() }))
+    .sort((a, b) => {
+      const da = a.dueAt?.toMillis?.() ?? +new Date(a.dueAt);
+      const dbt = b.dueAt?.toMillis?.() ?? +new Date(b.dueAt);
+      if (da !== dbt) return da - dbt;
+      if ((a.idx ?? 0) !== (b.idx ?? 0)) return (a.idx ?? 0) - (b.idx ?? 0);
+      // createdAt puede ser Timestamp; si no existe, queda al final
+      const ca = a.createdAt?.toMillis?.() ?? Number.MAX_SAFE_INTEGER;
+      const cb = b.createdAt?.toMillis?.() ?? Number.MAX_SAFE_INTEGER;
+      return ca - cb;
+    });
+
+  // Envío SECUENCIAL para mantener orden exacto
+  for (const job of jobs) {
     try {
       await deliverPayload(job.leadId, job.payload);
-      await d.ref.update({
+
+      await job.ref.update({
         status: 'sent',
         processedAt: FieldValue.serverTimestamp()
       });
 
-      // opcional: pisa lastMessageAt
       await db.collection('leads').doc(job.leadId).set({
         lastMessageAt: FieldValue.serverTimestamp()
       }, { merge: true });
 
+      // Pequeño respiro entre mensajes para que WA no reordene
+      await sleep(350);
     } catch (err) {
-      await d.ref.update({
+      await job.ref.update({
         status: 'error',
         processedAt: FieldValue.serverTimestamp(),
         error: String(err?.message || err)
       });
     }
-  }));
+  }
 
-  return snap.size;
+  return jobs.length;
 }

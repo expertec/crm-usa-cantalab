@@ -50,7 +50,7 @@ import OpenAI from 'openai';
 
 dotenv.config();
 
-const openai = new OpenAIImport({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 

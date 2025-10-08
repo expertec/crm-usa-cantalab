@@ -95,13 +95,36 @@ export async function connectToWhatsApp() {
 
       for (const msg of messages) {
         try {
-          if (!msg.key) continue;
-          const jid = msg.key.remoteJid;
-          if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
+          // --- Normalización robusta del JID ---
+          let rawJid = (msg?.key?.remoteJid || '').trim(); // ej: '5218311760335@s.whatsapp.net' o '521...:1@s.whatsapp.net'
+          if (!rawJid) {
+            console.warn('[WA] mensaje sin remoteJid, se ignora');
+            continue;
+          }
 
-          const phone = jid.split('@')[0]; // E164 sin '+', ej: 521831...
+          // Ignorar grupos/estados/newsletters (con log para diagnóstico)
+          if (rawJid.endsWith('@g.us') || rawJid === 'status@broadcast' || rawJid.endsWith('@newsletter')) {
+            console.log('[WA] JID no 1:1, skip:', rawJid);
+            continue;
+          }
+
+          const [jidUser, jidDomain] = rawJid.split('@');
+          const cleanUser = jidUser.split(':')[0].replace(/\s+/g, ''); // eliminar sufijos multi-device y espacios
+          const jid = `${cleanUser}@${jidDomain}`;
+
+          if (jidDomain !== 's.whatsapp.net') {
+            console.log('[WA] JID distinto a s.whatsapp.net, skip:', rawJid, '→ normalizado:', jid);
+            continue;
+          }
+
+          const phone = cleanUser;             // E164 sin '+', ej: 521831...
           const leadId = jid;
           const sender = msg.key.fromMe ? 'business' : 'lead';
+
+          // DEBUG opcional por número (pon 521... en env var DEBUG_PHONE)
+          if (process.env.DEBUG_PHONE && phone === String(process.env.DEBUG_PHONE)) {
+            console.log('[DEBUG_PHONE] rawJid=', rawJid, 'jid=', jid, 'sender=', sender);
+          }
 
           // ------- crear/actualizar LEAD (ANTES de parsear tipo) -------
           const leadRef = db.collection('leads').doc(leadId);
@@ -130,9 +153,11 @@ export async function connectToWhatsApp() {
 
             // programa secuencia inicial
             await scheduleSequenceForLead(leadId, trigger);
+
+            console.log('[WA] Lead CREADO:', { leadId, phone, trigger, fromMe: sender === 'business' });
           } else {
-            // solo lastMessageAt; etiquetas se ajustan después si hay hashtag
             await leadRef.update({ lastMessageAt: now() });
+            console.log('[WA] Lead ACTUALIZADO:', { leadId, phone, fromMe: sender === 'business' });
           }
 
           // ------- parseo de tipos (NUNCA hacer continue) -------
@@ -213,6 +238,8 @@ export async function connectToWhatsApp() {
               }
             }
           }
+
+          console.log('[WA] Guardando mensaje →', leadId, { mediaType, hasText: !!content, hasMedia: !!mediaUrl });
 
           // ------- guardar mensaje en subcolección -------
           const msgData = {

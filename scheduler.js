@@ -10,42 +10,18 @@ import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 
 import { processQueue, cancelSequences } from './queue.js';
-import { sendMessageToLead } from './whatsappService.js';
+import { sendMessageToLead, sendClipMessage } from './whatsappService.js';
 
 const bucket = admin.storage().bucket();
 const { FieldValue } = admin.firestore;
 
-/* ========================= OpenAI (v3/v4 compatible) ========================= */
+/* ========================= OpenAI ========================= */
 if (!process.env.OPENAI_API_KEY) {
   throw new Error('Falta la variable de entorno OPENAI_API_KEY');
 }
 
-let openai;          // cliente
-let isV4 = true;     // flag para saber cómo leer la respuesta
 
-try {
-  // Intento v4
-  openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  if (!openai?.chat?.completions?.create) isV4 = false;
-} catch {
-  isV4 = false;
-}
-
-if (!isV4) {
-  // Carga v3 (createChatCompletion)
-  const { Configuration, OpenAIApi } = await import('openai');
-  const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
-  openai = new OpenAIApi(configuration);
-}
-
-// Helper único para pedir completions sin preocuparnos por la versión
-async function chatCompletion({ model, messages, max_tokens, temperature }) {
-  if (isV4) {
-    return await openai.chat.completions.create({ model, messages, max_tokens, temperature });
-  } else {
-    return await openai.createChatCompletion({ model, messages, max_tokens, temperature });
-  }
-}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ========================= Utils ========================= */
 function replacePlaceholders(template, leadData) {
@@ -154,19 +130,16 @@ Nombre: ${d.includeName}.
 Anecdotas: ${d.anecdotes}.
   `.trim();
 
-  const resp = await chatCompletion({
-    model: 'gpt-4o',
-    messages: [
-      { role: 'system', content: 'Eres un compositor creativo.' },
-      { role: 'user', content: prompt }
-    ],
-    max_tokens: 400,
-    temperature: 0.7
-  });
+const resp = await openai.chat.completions.create({
+  model: 'gpt-4o',
+  messages: [
+    { role: 'system', content: 'Eres un compositor creativo.' },
+    { role: 'user', content: prompt }
+  ],
+  max_tokens: 400
+});
+const letra = resp.choices?.[0]?.message?.content?.trim();
 
-  const letra = (isV4
-    ? resp.choices?.[0]?.message?.content
-    : resp.data?.choices?.[0]?.message?.content)?.trim();
 
   if (!letra) throw new Error(`No letra para ${docSnap.id}`);
 
@@ -204,19 +177,14 @@ género ${genre} y tipo de voz ${voiceType}. Máx 120 caracteres, usa comas para
 Ejemplo: "rock pop con influencias blues, guitarra eléctrica, batería enérgica".
   `.trim();
 
-  const gptRes = await chatCompletion({
-    model: 'gpt-4o',
-    messages: [
-      { role: 'system', content: 'Eres un redactor creativo de prompts musicales.' },
-      { role: 'user', content: `Refina para <120 chars y separa por comas: "${draft}"` }
-    ],
-    max_tokens: 120,
-    temperature: 0.7
-  });
-
-  const stylePrompt = (isV4
-    ? gptRes.choices?.[0]?.message?.content
-    : gptRes.data?.choices?.[0]?.message?.content)?.trim();
+const gptRes = await openai.chat.completions.create({
+  model: 'gpt-4o',
+  messages: [
+    { role: 'system', content: 'Eres un redactor creativo de prompts musicales.' },
+    { role: 'user', content: `Refina para <120 chars y separa por comas: "${draft}"` }
+  ]
+});
+const stylePrompt = gptRes.choices?.[0]?.message?.content?.trim();
 
   await docSnap.ref.update({ stylePrompt, status: 'Sin música' });
   console.log(`✅ generarPromptParaMusica: ${docSnap.id} → "${stylePrompt}"`);
@@ -352,6 +320,7 @@ async function procesarClips() {
   }
 }
 
+// 5) Enviar letra + clip a WhatsApp y marcar Enviada
 // 5) Enviar letra + link de escucha a WhatsApp y marcar Enviada
 async function enviarMusicaPorWhatsApp() {
   const snap = await db.collection('musica').where('status', '==', 'Enviar música').get();
@@ -406,6 +375,7 @@ async function enviarMusicaPorWhatsApp() {
     }
   }
 }
+
 
 // 6) Reintento de stuck (Suno)
 async function retryStuckMusic(thresholdMin = 10) {

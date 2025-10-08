@@ -27,33 +27,9 @@ const { FieldValue } = admin.firestore;
 const bucket = admin.storage().bucket();
 
 /* ------------------------------ helpers ------------------------------ */
-function normalizePhoneNumber(phone) {
-  // Eliminar todo lo que no sea dígito
-  let num = String(phone).replace(/\D/g, '');
-  
-  // Si tiene 10 dígitos, agregar 521 (celular México)
-  if (num.length === 10) {
-    return '521' + num;
-  }
-  
-  // Si tiene 12 dígitos y empieza con 52, convertir a 521
-  if (num.length === 12 && num.startsWith('52')) {
-    return '521' + num.substring(2);
-  }
-  
-  // Si tiene 13 dígitos y empieza con 521, dejarlo así
-  if (num.length === 13 && num.startsWith('521')) {
-    return num;
-  }
-  
-  // Para cualquier otro caso, retornar tal cual
-  return num;
-}
-
 function firstName(n = '') {
   return String(n).trim().split(/\s+/)[0] || '';
 }
-
 function tpl(str, lead) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (_, f) => {
     if (f === 'nombre') return firstName(lead?.nombre || '');
@@ -120,12 +96,9 @@ export async function connectToWhatsApp() {
           const jid = msg.key.remoteJid;
           if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
-          const rawPhone = jid.split('@')[0];
-          const phone = normalizePhoneNumber(rawPhone); // 🔧 521 + 10 dígitos
-          const leadId = phone; // 🔧 CAMBIO: usar teléfono normalizado como ID
+          const phone = jid.split('@')[0];
+          const leadId = jid;
           const sender = msg.key.fromMe ? 'business' : 'lead';
-
-          console.log(`📱 Mensaje recibido de: ${rawPhone} → normalizado: ${phone} → leadId: ${leadId}`);
 
           // contenido / media
           let content = '';
@@ -173,7 +146,7 @@ export async function connectToWhatsApp() {
             continue; // otros tipos los ignoramos por ahora
           }
 
-          // ------- buscar/crear LEAD (docId = teléfono normalizado) -------
+          // ------- buscar/crear LEAD (docId = jid) -------
           const leadRef = db.collection('leads').doc(leadId);
           const leadSnap = await leadRef.get();
 
@@ -186,14 +159,13 @@ export async function connectToWhatsApp() {
               : (cfg.defaultTrigger || 'NuevoLead');
 
           const baseLead = {
-            telefono: phone,                // 🔧 521 + 10 dígitos
+            telefono: phone,                // almacenamos E164 sin '+'
             nombre: msg.pushName || '',
             source: 'WhatsApp',
           };
 
           if (!leadSnap.exists) {
-            console.log(`✨ Creando nuevo lead: ${leadId}`);
-            // crear lead
+            // crear lead (sin guardar secuencias en el doc; usamos la cola)
             await leadRef.set({
               ...baseLead,
               fecha_creacion: new Date(),
@@ -205,7 +177,6 @@ export async function connectToWhatsApp() {
 
             // programa secuencia inicial
             await scheduleSequenceForLead(leadId, trigger);
-            console.log(`📅 Secuencia "${trigger}" programada para ${leadId}`);
 
             // si el trigger inicial fuera MusicaLead, cancela recordatorios
             if (trigger === 'MusicaLead') {
@@ -228,7 +199,6 @@ export async function connectToWhatsApp() {
             // si no tenía esa etiqueta, programa secuencia
             if (!hadTag) {
               await scheduleSequenceForLead(leadId, trigger);
-              console.log(`📅 Nueva secuencia "${trigger}" programada para ${leadId}`);
             }
 
             // si ahora es MusicaLead, cancela captación
@@ -255,7 +225,7 @@ export async function connectToWhatsApp() {
           if (sender === 'lead') upd.unreadCount = FieldValue.increment(1);
           await db.collection('leads').doc(leadId).update(upd);
         } catch (err) {
-          console.error('❌ messages.upsert error:', err);
+          console.error('messages.upsert error:', err);
         }
       }
     });
@@ -283,10 +253,9 @@ export function getSessionPhone() {
 
 export async function sendMessageToLead(phone, messageContent) {
   if (!whatsappSock) throw new Error('No hay conexión activa con WhatsApp');
-  const num = normalizePhoneNumber(phone); // 🔧 Normalizar
+  let num = String(phone).replace(/\D/g, '');
+  if (num.length === 10) num = '52' + num;
   const jid = `${num}@s.whatsapp.net`;
-
-  console.log(`📤 Enviando mensaje a ${jid}`);
 
   await whatsappSock.sendMessage(
     jid,
@@ -295,13 +264,12 @@ export async function sendMessageToLead(phone, messageContent) {
   );
 
   // persistir en Firestore si existe el lead
-  const leadRef = db.collection('leads').doc(num);
-  const leadSnap = await leadRef.get();
-  
-  if (leadSnap.exists) {
+  const q = await db.collection('leads').where('telefono', '==', num).limit(1).get();
+  if (!q.empty) {
+    const leadId = q.docs[0].id;
     const outMsg = { content: messageContent, sender: 'business', timestamp: new Date() };
-    await leadRef.collection('messages').add(outMsg);
-    await leadRef.update({ lastMessageAt: outMsg.timestamp });
+    await db.collection('leads').doc(leadId).collection('messages').add(outMsg);
+    await db.collection('leads').doc(leadId).update({ lastMessageAt: outMsg.timestamp });
   }
   return { success: true };
 }
@@ -310,7 +278,8 @@ export async function sendFullAudioAsDocument(phone, fileUrl) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
-  const num = normalizePhoneNumber(phone);
+  let num = String(phone).replace(/\D/g, '');
+  if (num.length === 10) num = '52' + num;
   const jid = `${num}@s.whatsapp.net`;
 
   const res = await axios.get(fileUrl, { responseType: 'arraybuffer' });
@@ -329,7 +298,7 @@ export async function sendAudioMessage(phone, filePath) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('Socket de WhatsApp no está conectado');
 
-  const num = normalizePhoneNumber(phone);
+  const num = String(phone).replace(/\D/g, '');
   const jid = `${num}@s.whatsapp.net`;
 
   const audioBuffer = fs.readFileSync(filePath);
@@ -341,13 +310,12 @@ export async function sendAudioMessage(phone, filePath) {
   await file.save(audioBuffer, { contentType: 'audio/mp4' });
   const [mediaUrl] = await file.getSignedUrl({ action: 'read', expires: '03-01-2500' });
 
-  const leadRef = db.collection('leads').doc(num);
-  const leadSnap = await leadRef.get();
-  
-  if (leadSnap.exists) {
+  const q = await db.collection('leads').where('telefono', '==', num).limit(1).get();
+  if (!q.empty) {
+    const leadId = q.docs[0].id;
     const msgData = { content: '', mediaType: 'audio', mediaUrl, sender: 'business', timestamp: new Date() };
-    await leadRef.collection('messages').add(msgData);
-    await leadRef.update({ lastMessageAt: msgData.timestamp });
+    await db.collection('leads').doc(leadId).collection('messages').add(msgData);
+    await db.collection('leads').doc(leadId).update({ lastMessageAt: msgData.timestamp });
   }
 }
 
@@ -355,7 +323,8 @@ export async function sendClipMessage(phone, clipUrl) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
-  const num = normalizePhoneNumber(phone);
+  let num = String(phone).replace(/\D/g, '');
+  if (num.length === 10) num = '52' + num;
   const jid = `${num}@s.whatsapp.net`;
 
   const payload = { audio: { url: clipUrl }, mimetype: 'audio/mp4', ptt: false };

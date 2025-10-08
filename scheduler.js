@@ -1,7 +1,7 @@
 // src/server/scheduler.js
 import admin from 'firebase-admin';
 import { db } from './firebaseAdmin.js';
-import OpenAI from 'openai';
+import { Configuration, OpenAIApi } from 'openai';
 
 import fs from 'fs';
 import os from 'os';
@@ -19,9 +19,8 @@ const { FieldValue } = admin.firestore;
 if (!process.env.OPENAI_API_KEY) {
   throw new Error('Falta la variable de entorno OPENAI_API_KEY');
 }
-
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const configuration = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAIApi(configuration);
 
 /* ========================= Utils ========================= */
 function replacePlaceholders(template, leadData) {
@@ -130,17 +129,16 @@ Nombre: ${d.includeName}.
 Anecdotas: ${d.anecdotes}.
   `.trim();
 
-const resp = await openai.chat.completions.create({
-  model: 'gpt-4o',
-  messages: [
-    { role: 'system', content: 'Eres un compositor creativo.' },
-    { role: 'user', content: prompt }
-  ],
-  max_tokens: 400
-});
-const letra = resp.choices?.[0]?.message?.content?.trim();
+  const resp = await openai.createChatCompletion({
+    model: 'gpt-4o',
+    messages: [
+      { role: 'system', content: 'Eres un compositor creativo.' },
+      { role: 'user', content: prompt }
+    ],
+    max_tokens: 400
+  });
 
-
+  const letra = resp.data.choices?.[0]?.message?.content?.trim();
   if (!letra) throw new Error(`No letra para ${docSnap.id}`);
 
   await docSnap.ref.update({
@@ -177,15 +175,15 @@ género ${genre} y tipo de voz ${voiceType}. Máx 120 caracteres, usa comas para
 Ejemplo: "rock pop con influencias blues, guitarra eléctrica, batería enérgica".
   `.trim();
 
-const gptRes = await openai.chat.completions.create({
-  model: 'gpt-4o',
-  messages: [
-    { role: 'system', content: 'Eres un redactor creativo de prompts musicales.' },
-    { role: 'user', content: `Refina para <120 chars y separa por comas: "${draft}"` }
-  ]
-});
-const stylePrompt = gptRes.choices?.[0]?.message?.content?.trim();
+  const gptRes = await openai.createChatCompletion({
+    model: 'gpt-4o',
+    messages: [
+      { role: 'system', content: 'Eres un redactor creativo de prompts musicales.' },
+      { role: 'user', content: `Refina para <120 chars y separa por comas: "${draft}"` }
+    ]
+  });
 
+  const stylePrompt = gptRes.data.choices[0].message.content.trim();
   await docSnap.ref.update({ stylePrompt, status: 'Sin música' });
   console.log(`✅ generarPromptParaMusica: ${docSnap.id} → "${stylePrompt}"`);
 }

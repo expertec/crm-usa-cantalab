@@ -45,14 +45,14 @@ import {
 } from './scheduler.js';
 
 // 🔹 OpenAI para el mensaje de empatía
-import OpenAIImport from 'openai';
+
+import OpenAI from 'openai';
 
 dotenv.config();
 
-const openai = new OpenAI({
+const openai = new OpenAIImport({
   apiKey: process.env.OPENAI_API_KEY
 });
-
 
 const app = express();
 const port = process.env.PORT || 3001;

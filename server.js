@@ -372,41 +372,91 @@ app.post('/api/lead/after-form', async (req, res) => {
     await cancelSequences(leadId, ['NuevoLead']);
     await db.collection('leads').doc(leadId).set({ nuevoLeadCancelled: true }, { merge: true });
 
-    // 2) Mensaje de empatía con GPT (compat)
-    const prompt = `
-Eres un asistente empático que escribe un mensaje breve (máx 2 frases),
-en español informal, para WhatsApp. Habla en segunda persona y nombra por su
-primer nombre si está disponible. Contexto:
+   // 2) Mensaje de empatía (centrado en anecdotes) + cierre fijo
+const nombre      = (summary?.nombre || lead?.nombre || '').toString().trim();
+const firstName   = (nombre || '').split(/\s+/)[0] || '';
+const anecdotes   = (summary?.anecdotes || '').toString().trim();  // <— del formulario real
+const genre       = (summary?.genre || '').toString().trim();      // <— del formulario real
+const artist      = (summary?.artist || '').toString().trim();     // <— del formulario real
 
-- Nombre del cliente: ${summary?.nombre || lead?.nombre || ''}
-- Propósito: ${summary?.proposito || ''}
-- Género musical deseado: ${summary?.genero || ''}
-- Artista de referencia: ${summary?.artista || ''}
-- Anécdotas: ${summary?.anecdotas || ''}
+const hayAnecdota = anecdotes.length > 0;
 
-Objetivo: inspirar confianza y avisar que ya estamos creando la canción y se la
-mandaremos enseguida. Evita promesas de tiempo exacto. No uses comillas.
-    `.trim();
+const reglas = `
+Escribe un mensaje de WhatsApp en español, de 1 o 2 frases, cálido y natural.
+1) Saluda por el primer nombre si existe ("${firstName}").
+2) Comenta empáticamente SOBRE LA ANÉCDOTA exactamente como está (no inventes).
+3) Puedes mencionar el género "${genre}" de forma breve, solo si ayuda.
+4) Menciona un artista SOLO si viene explícito ("${artist}"); si no, no lo inventes.
+5) Sin comillas, emojis ni hashtags.
+6) La segunda frase debe ser EXACTAMENTE: "Voy a poner todo de mí para hacer esta canción; enseguida te la envío."
+`.trim();
 
-    let textoEmpatia = '¡Gracias por la info! Estamos creando tu canción y en breve te la enviamos.';
-    try {
-      const { text, mode } = await chatCompletionCompat({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Eres conciso, cálido y natural.' },
-          { role: 'user', content: prompt }
-        ],
-        max_tokens: 120,
-        temperature: 0.7
-      });
-      if (text) textoEmpatia = text;
-      console.log('[GPT empatía] modo:', mode, '→', textoEmpatia);
-    } catch (e) {
-      console.warn('GPT empatía falló, usando fallback:', e?.message);
-    }
+const contexto = `
+Nombre: ${firstName || '(sin nombre)'}
+Anécdota: ${hayAnecdota ? anecdotes : '(sin anécdota)'}
+Género: ${genre || '(sin género)'}
+Artista: ${artist || '(sin artista)'}
+`.trim();
 
-    // 3) Enviar mensaje de empatía
-    await sendMessageToLead(phone, textoEmpatia);
+const promptEmpatia = `
+${reglas}
+
+Objetivo: confirmar que recibimos su información y reflejar la anécdota con empatía.
+
+Contexto del cliente:
+${contexto}
+
+Redacta el mensaje final (sin comillas).
+`.trim();
+
+let textoEmpatia =
+  '¡Gracias por tu información! Ya estoy trabajando en tu canción. ' +
+  'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
+
+function sanitize(txt) {
+  const cierreFijo = 'Voy a poner todo de mí para hacer esta canción; enseguida te la envío.';
+  let out = String(txt || '')
+    .replace(/[“”"]+/g, '')     // sin comillas
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Fuerza cierre fijo como segunda frase
+  if (out) {
+    const primera = out.split(/(?<=[.!?])\s+/)[0] || out;
+    out = `${primera} ${cierreFijo}`;
+  } else {
+    out = cierreFijo;
+  }
+
+  // Si no hay anécdota, evita frases que finjan detalles
+  if (!hayAnecdota) {
+    out = out.replace(/\b(inspirad[oa]\s+en|basad[oa]\s+en|sobre\s+la\s+historia\s+de)\b.*?(?=[.!]|$)/gi, '').trim();
+    if (!out.endsWith(cierreFijo)) out = `${out} ${cierreFijo}`;
+  }
+
+  return out.length > 280 ? out.slice(0, 280).trim() : out;
+}
+
+try {
+  const { text } = await chatCompletionCompat({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: 'Eres conciso, cálido y natural. Cumple estrictamente las reglas.' },
+      { role: 'user', content: promptEmpatia }
+    ],
+    max_tokens: 140,
+    temperature: 0.4
+  });
+  const limpio = sanitize(text);
+  if (limpio) textoEmpatia = limpio;
+  console.log('[GPT empatía] →', textoEmpatia);
+} catch (e) {
+  console.warn('GPT empatía falló, usando fallback:', e?.message);
+}
+
+// 3) Enviar mensaje de empatía
+await sendMessageToLead(phone, textoEmpatia);
+
 
     // 4) Encolar MusicaLead (editable desde tu panel)
     await scheduleSequenceForLead(leadId, 'MusicaLead', new Date());

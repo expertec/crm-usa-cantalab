@@ -27,9 +27,33 @@ const { FieldValue } = admin.firestore;
 const bucket = admin.storage().bucket();
 
 /* ------------------------------ helpers ------------------------------ */
+function normalizePhoneNumber(phone) {
+  // Eliminar todo lo que no sea dígito
+  let num = String(phone).replace(/\D/g, '');
+  
+  // Si tiene 10 dígitos, agregar 521 (celular México)
+  if (num.length === 10) {
+    return '521' + num;
+  }
+  
+  // Si tiene 12 dígitos y empieza con 52, convertir a 521
+  if (num.length === 12 && num.startsWith('52')) {
+    return '521' + num.substring(2);
+  }
+  
+  // Si tiene 13 dígitos y empieza con 521, dejarlo así
+  if (num.length === 13 && num.startsWith('521')) {
+    return num;
+  }
+  
+  // Para cualquier otro caso, retornar tal cual
+  return num;
+}
+
 function firstName(n = '') {
   return String(n).trim().split(/\s+/)[0] || '';
 }
+
 function tpl(str, lead) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (_, f) => {
     if (f === 'nombre') return firstName(lead?.nombre || '');
@@ -96,7 +120,8 @@ export async function connectToWhatsApp() {
           const jid = msg.key.remoteJid;
           if (!jid || jid.endsWith('@g.us')) continue; // ignorar grupos
 
-          const phone = jid.split('@')[0];
+          const rawPhone = jid.split('@')[0];
+          const phone = normalizePhoneNumber(rawPhone); // 🔧 Normalizar a 521 + 10 dígitos
           const leadId = jid;
           const sender = msg.key.fromMe ? 'business' : 'lead';
 
@@ -159,7 +184,7 @@ export async function connectToWhatsApp() {
               : (cfg.defaultTrigger || 'NuevoLead');
 
           const baseLead = {
-            telefono: phone,                // almacenamos E164 sin '+'
+            telefono: phone,                // 🔧 almacenamos 521 + 10 dígitos
             nombre: msg.pushName || '',
             source: 'WhatsApp',
           };
@@ -253,8 +278,7 @@ export function getSessionPhone() {
 
 export async function sendMessageToLead(phone, messageContent) {
   if (!whatsappSock) throw new Error('No hay conexión activa con WhatsApp');
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
+  const num = normalizePhoneNumber(phone); // 🔧 Normalizar
   const jid = `${num}@s.whatsapp.net`;
 
   await whatsappSock.sendMessage(
@@ -278,8 +302,7 @@ export async function sendFullAudioAsDocument(phone, fileUrl) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
+  const num = normalizePhoneNumber(phone); // 🔧 Normalizar
   const jid = `${num}@s.whatsapp.net`;
 
   const res = await axios.get(fileUrl, { responseType: 'arraybuffer' });
@@ -298,7 +321,7 @@ export async function sendAudioMessage(phone, filePath) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('Socket de WhatsApp no está conectado');
 
-  const num = String(phone).replace(/\D/g, '');
+  const num = normalizePhoneNumber(phone); // 🔧 Normalizar
   const jid = `${num}@s.whatsapp.net`;
 
   const audioBuffer = fs.readFileSync(filePath);
@@ -323,8 +346,7 @@ export async function sendClipMessage(phone, clipUrl) {
   const sock = getWhatsAppSock();
   if (!sock) throw new Error('No hay conexión activa con WhatsApp');
 
-  let num = String(phone).replace(/\D/g, '');
-  if (num.length === 10) num = '52' + num;
+  const num = normalizePhoneNumber(phone); // 🔧 Normalizar
   const jid = `${num}@s.whatsapp.net`;
 
   const payload = { audio: { url: clipUrl }, mimetype: 'audio/mp4', ptt: false };

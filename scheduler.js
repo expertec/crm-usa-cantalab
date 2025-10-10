@@ -344,7 +344,7 @@ async function enviarMusicaPorWhatsApp() {
       await sendMessageToLead(leadPhone, saludo);
 
       // 2) Generar link de escucha (tu frontend /escuchar/:leadPhone debe respetar maxPlays y evitar descarga)
-      const listenUrl = `https://cantalab.com/escuchar/${leadPhone}`;
+      const listenUrl = `https://crmusa.cantalab.com/escuchar/${leadPhone}`;
 
       // 3) Enviar mensaje con link
       await sendMessageToLead(

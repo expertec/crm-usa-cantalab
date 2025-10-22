@@ -237,6 +237,8 @@ app.post('/api/plans', async (req, res) => {
 });
 
 
+
+
 // Obtener un plan por id
 app.get('/api/plans/:id', async (req, res) => {
   try {
@@ -261,6 +263,29 @@ app.delete('/api/plans/:id', async (req, res) => {
     res.status(500).json({ error: 'internal_error' });
   }
 });
+
+
+// Listar planes (?active=true para solo activos)
+app.get('/api/plans', async (req, res) => {
+  try {
+    const onlyActive = String(req.query.active || '').toLowerCase() === 'true';
+
+    // Por defecto ordenamos por displayOrder asc
+    // Si pides solo activos, evitamos orderBy para no requerir índice compuesto
+    let q = plansColl.orderBy('displayOrder', 'asc');
+    if (onlyActive) {
+      q = plansColl.where('active', '==', true);
+    }
+
+    const snap = await q.get();
+    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ items });
+  } catch (e) {
+    console.error('GET /api/plans error:', e?.message, e);
+    res.status(500).json({ error: e?.message || 'internal_error' });
+  }
+});
+
 
 /* ----------------------------- Suno callback ---------------------------- */
 app.post('/api/suno/callback', express.json(), async (req, res) => {

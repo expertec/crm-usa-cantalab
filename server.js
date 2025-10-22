@@ -11,6 +11,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import axios from 'axios';
 import os from 'os';
+import Stripe from 'stripe';
 
 import { db, admin } from './firebaseAdmin.js';
 const bucket = admin.storage().bucket();
@@ -58,6 +59,14 @@ function assertOpenAIKey() {
 
 // En algunas instalaciones, el paquete exporta { OpenAI }, en otras el ctor por default
 const OpenAICtor = OpenAIImport?.OpenAI || OpenAIImport;
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-06-20' });
+
+function assertStripe() {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    throw new Error('Falta STRIPE_SECRET_KEY');
+  }
+}
 
 
 /** Devuelve un cliente y el “modo” detectado */
@@ -205,6 +214,9 @@ app.post('/api/plans', async (req, res) => {
       stripe = { priceId };
     }
 
+
+
+
     // Construye payload sin undefined
     const payloadRaw = {
       name,
@@ -237,6 +249,70 @@ app.post('/api/plans', async (req, res) => {
 });
 
 
+// Crear sesión de checkout de Stripe para suscripción
+app.post('/api/billing/checkout', async (req, res) => {
+  try {
+    assertStripe();
+
+    const {
+      planId,                   // requerido
+      phone,                    // opcional (lo metemos en metadata)
+      email,                    // opcional (si lo pasas, intento reusar customer)
+      successUrl,               // opcional
+      cancelUrl                 // opcional
+    } = req.body || {};
+
+    if (!planId) return res.status(400).json({ error: 'planId requerido' });
+
+    // Buscar plan y su priceId
+    const planDoc = await plansColl.doc(planId).get();
+    if (!planDoc.exists) return res.status(404).json({ error: 'plan_no_encontrado' });
+    const plan = planDoc.data();
+    const priceId = plan?.stripe?.priceId;
+    if (!priceId) return res.status(400).json({ error: 'plan_sin_priceId' });
+
+    // Reusar o crear customer por email (si viene); si no, que Checkout lo cree.
+    let customerId;
+    if (email) {
+      const existing = await stripe.customers.list({ email, limit: 1 });
+      if (existing.data.length) {
+        customerId = existing.data[0].id;
+      } else {
+        const created = await stripe.customers.create({
+          email,
+          phone: phone || undefined,
+          metadata: { phone: phone || '', planId }
+        });
+        customerId = created.id;
+      }
+    }
+
+    const origin = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
+    const success_url = (successUrl || `${origin}/cliente/login?sub=ok`);
+    const cancel_url  = (cancelUrl || `${origin}/suscripcion?cancel=1`);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      ...(customerId ? { customer: customerId } : {}),
+      allow_promotion_codes: true,
+      billing_address_collection: 'auto',
+      phone_number_collection: { enabled: true },
+      client_reference_id: `${planId}:${phone || ''}`,
+      metadata: {
+        planId,
+        phone: phone || ''
+      },
+      success_url,
+      cancel_url
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error('POST /api/billing/checkout error:', e?.message, e);
+    return res.status(500).json({ error: e?.message || 'internal_error' });
+  }
+});
 
 
 // Obtener un plan por id

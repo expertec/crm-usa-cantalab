@@ -160,21 +160,82 @@ app.get('/api/whatsapp/number', (_req, res) => {
   return res.status(503).json({ error: 'WhatsApp no conectado' });
 });
 
+// Helper: elimina undefined (también dentro de objetos/arrays)
+function pruneUndefined(value) {
+  if (Array.isArray(value)) {
+    return value.map(pruneUndefined).filter(v => v !== undefined);
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      const cleaned = pruneUndefined(v);
+      if (cleaned !== undefined) out[k] = cleaned;
+    }
+    return out;
+  }
+  return value === undefined ? undefined : value;
+}
 
-// Listar planes (usa ?active=true para solo activos)
-app.get('/api/plans', async (req, res) => {
+// Crear / Actualizar (upsert) — SIN undefined a Firestore
+app.post('/api/plans', async (req, res) => {
   try {
-    const onlyActive = String(req.query.active || '').toLowerCase() === 'true';
-    let q = plansColl.orderBy('displayOrder', 'asc');
-    if (onlyActive) q = q.where('active', '==', true);
-    const snap = await q.get();
-    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json({ items });
+    const body = req.body || {};
+
+    const id = body.id || null;
+    const name = String(body.name || '').trim();
+    const priceMonthly = Number(body.priceMonthly);
+    const priceYearly = body.priceYearly !== undefined ? Number(body.priceYearly) : undefined;
+    const songsPerMonth = Number(body.songsPerMonth);
+    const currency = String(body.currency || 'MXN').toUpperCase();
+    const features = Array.isArray(body.features) ? body.features.map(String) : [];
+    const active = !!body.active;
+    const displayOrder = Number(body.displayOrder || 0);
+    const yearlyDiscount = body.yearlyDiscount !== undefined ? Number(body.yearlyDiscount) : undefined;
+    const description = String(body.description || '');
+
+    // Validación básica
+    if (!name) return res.status(400).json({ error: 'name requerido' });
+    if (!Number.isFinite(priceMonthly)) return res.status(400).json({ error: 'priceMonthly debe ser numérico' });
+    if (!Number.isFinite(songsPerMonth)) return res.status(400).json({ error: 'songsPerMonth debe ser numérico' });
+
+    // Construye stripe SOLO si viene priceId (para no meter undefined)
+    let stripe;
+    const priceId = body?.stripe?.priceId ? String(body.stripe.priceId).trim() : '';
+    if (priceId) {
+      stripe = { priceId };
+    }
+
+    // Construye payload sin undefined
+    const payloadRaw = {
+      name,
+      description,
+      priceMonthly,
+      currency,
+      songsPerMonth,
+      features,
+      active,
+      displayOrder,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      // opcionales:
+      priceYearly: Number.isFinite(priceYearly) ? priceYearly : undefined,
+      yearlyDiscount: Number.isFinite(yearlyDiscount) ? yearlyDiscount : undefined,
+      stripe, // SOLO si existe queda, si no se purga
+      ...(id ? {} : { createdAt: admin.firestore.FieldValue.serverTimestamp() })
+    };
+
+    const payload = pruneUndefined(payloadRaw);
+
+    const ref = id ? plansColl.doc(id) : plansColl.doc();
+    await ref.set(payload, { merge: true });
+
+    const saved = await ref.get();
+    return res.json({ id: ref.id, ...saved.data() });
   } catch (e) {
-    console.error('GET /api/plans', e);
-    res.status(500).json({ error: 'internal_error' });
+    console.error('POST /api/plans error:', e?.message, e);
+    return res.status(500).json({ error: e?.message || 'internal_error' });
   }
 });
+
 
 // Obtener un plan por id
 app.get('/api/plans/:id', async (req, res) => {
@@ -188,60 +249,7 @@ app.get('/api/plans/:id', async (req, res) => {
   }
 });
 
-// Crear / Actualizar (upsert)
-// Si envías "id", actualiza; si no, crea uno nuevo.
-app.post('/api/plans', async (req, res) => {
-  try {
-    const {
-      id,
-      name,
-      description = '',
-      priceMonthly,
-      priceYearly,                // opcional
-      currency = 'MXN',
-      songsPerMonth,
-      features = [],
-      stripe = {},                // { priceId?: string }
-      active = true,
-      displayOrder = 0,
-      yearlyDiscount,             // opcional: para cálculo de anual en front
-    } = req.body || {};
 
-    if (!name || !Number.isFinite(priceMonthly) || !Number.isFinite(songsPerMonth)) {
-      return res.status(400).json({ error: 'name, priceMonthly y songsPerMonth son requeridos' });
-    }
-
-    const payload = {
-      name: String(name).trim(),
-      description: String(description || ''),
-      priceMonthly: Number(priceMonthly),
-      currency: String(currency || 'MXN').toUpperCase(),
-      songsPerMonth: Number(songsPerMonth),
-      features: Array.isArray(features) ? features.map(String) : [],
-      stripe: {
-        priceId: stripe?.priceId ? String(stripe.priceId) : undefined,
-      },
-      active: !!active,
-      displayOrder: Number(displayOrder) || 0,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    // opcionales coherentes
-    if (Number.isFinite(priceYearly)) payload.priceYearly = Number(priceYearly);
-    if (Number.isFinite(yearlyDiscount)) payload.yearlyDiscount = Number(yearlyDiscount);
-
-    if (!id) payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
-
-    const ref = id ? plansColl.doc(id) : plansColl.doc();
-    await ref.set(payload, { merge: true });
-
-    const saved = await ref.get();
-    res.json({ id: ref.id, ...saved.data() });
-  } catch (e) {
-    console.error('POST /api/plans', e);
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
 
 // Eliminar un plan
 app.delete('/api/plans/:id', async (req, res) => {

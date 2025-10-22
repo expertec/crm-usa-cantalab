@@ -59,6 +59,7 @@ function assertOpenAIKey() {
 // En algunas instalaciones, el paquete exporta { OpenAI }, en otras el ctor por default
 const OpenAICtor = OpenAIImport?.OpenAI || OpenAIImport;
 
+
 /** Devuelve un cliente y el “modo” detectado */
 async function getOpenAI() {
   assertOpenAIKey();
@@ -141,6 +142,10 @@ const app = express();
 const port = process.env.PORT || 3001;
 const upload = multer({ dest: path.resolve('./uploads') });
 
+// ===================== PLANS API (ADMIN) =====================
+const plansColl = db.collection('billing').doc('plans').collection('items');
+
+
 app.use(cors());
 app.use(bodyParser.json());
 
@@ -153,6 +158,100 @@ app.get('/api/whatsapp/number', (_req, res) => {
   const phone = getSessionPhone();
   if (phone) return res.json({ phone });
   return res.status(503).json({ error: 'WhatsApp no conectado' });
+});
+
+
+// Listar planes (usa ?active=true para solo activos)
+app.get('/api/plans', async (req, res) => {
+  try {
+    const onlyActive = String(req.query.active || '').toLowerCase() === 'true';
+    let q = plansColl.orderBy('displayOrder', 'asc');
+    if (onlyActive) q = q.where('active', '==', true);
+    const snap = await q.get();
+    const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ items });
+  } catch (e) {
+    console.error('GET /api/plans', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Obtener un plan por id
+app.get('/api/plans/:id', async (req, res) => {
+  try {
+    const doc = await plansColl.doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: 'not_found' });
+    res.json({ id: doc.id, ...doc.data() });
+  } catch (e) {
+    console.error('GET /api/plans/:id', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Crear / Actualizar (upsert)
+// Si envías "id", actualiza; si no, crea uno nuevo.
+app.post('/api/plans', async (req, res) => {
+  try {
+    const {
+      id,
+      name,
+      description = '',
+      priceMonthly,
+      priceYearly,                // opcional
+      currency = 'MXN',
+      songsPerMonth,
+      features = [],
+      stripe = {},                // { priceId?: string }
+      active = true,
+      displayOrder = 0,
+      yearlyDiscount,             // opcional: para cálculo de anual en front
+    } = req.body || {};
+
+    if (!name || !Number.isFinite(priceMonthly) || !Number.isFinite(songsPerMonth)) {
+      return res.status(400).json({ error: 'name, priceMonthly y songsPerMonth son requeridos' });
+    }
+
+    const payload = {
+      name: String(name).trim(),
+      description: String(description || ''),
+      priceMonthly: Number(priceMonthly),
+      currency: String(currency || 'MXN').toUpperCase(),
+      songsPerMonth: Number(songsPerMonth),
+      features: Array.isArray(features) ? features.map(String) : [],
+      stripe: {
+        priceId: stripe?.priceId ? String(stripe.priceId) : undefined,
+      },
+      active: !!active,
+      displayOrder: Number(displayOrder) || 0,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // opcionales coherentes
+    if (Number.isFinite(priceYearly)) payload.priceYearly = Number(priceYearly);
+    if (Number.isFinite(yearlyDiscount)) payload.yearlyDiscount = Number(yearlyDiscount);
+
+    if (!id) payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
+
+    const ref = id ? plansColl.doc(id) : plansColl.doc();
+    await ref.set(payload, { merge: true });
+
+    const saved = await ref.get();
+    res.json({ id: ref.id, ...saved.data() });
+  } catch (e) {
+    console.error('POST /api/plans', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Eliminar un plan
+app.delete('/api/plans/:id', async (req, res) => {
+  try {
+    await plansColl.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/plans/:id', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
 });
 
 /* ----------------------------- Suno callback ---------------------------- */
